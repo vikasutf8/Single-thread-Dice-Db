@@ -1,4 +1,6 @@
 const net = require("node:net");
+const { readCmd } = require("./redis-cmd");
+const { evalAndRespond, respondError } = require("./eval");
 
 // Active client connection count.
 let conClient = 0;
@@ -32,24 +34,39 @@ function RunSyncTcpServer(host, port) {
             ` | Active clients: ${conClient}`
         );
 
-        // Buffer incomplete TCP messages.
-        let buffer = "";
+        // Buffer incomplete TCP messages (RESP bytes, not text lines).
+        let leftover = Buffer.alloc(0);
 
         // Receive data from the client.
-        conn.on("data", (data) => {
-            buffer += data.toString();
+        // Infinite read loop: drain every complete RedisCmd in the buffer.
+        conn.on("data", (chunk) => {
+            leftover = Buffer.concat([leftover, chunk]);
 
-            // Process newline-delimited commands.
-            let newlineIndex;
+            while (leftover.length > 0) {
+                const { cmd, n, err } = readCmd(leftover);
 
-            while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
-                const cmd = buffer.slice(0, newlineIndex + 1);
-                buffer = buffer.slice(newlineIndex + 1);
+                if (err) {
+                    // Incomplete: wait for more bytes.
+                    if (err.message.startsWith("incomplete")) break;
+                    // Bare Enter in nc: just consume, no reply.
+                    if (err.message === "empty line") {
+                        leftover = leftover.slice(n);
+                        if (leftover.length === 0) break;
+                        continue;
+                    }
+                    // Bad shape / protocol error: reply error, drop bad bytes.
+                    console.log("readCmd error:", err.message);
+                    respondError(err, conn);
+                    leftover = n > 0 ? leftover.slice(n) : Buffer.alloc(0);
+                    if (leftover.length === 0) break;
+                    continue;
+                }
 
-                console.log("Received:", JSON.stringify(cmd));
+                console.log("Received cmd:", cmd.Cmd, JSON.stringify(cmd.Args));
 
-                // Echo the exact command back.
-                respond(conn, cmd);
+                // Dispatch: PING -> evalPING, else evalDefault.
+                evalAndRespond(cmd, conn);
+                leftover = leftover.slice(n);
             }
         });
 
@@ -80,16 +97,11 @@ function RunSyncTcpServer(host, port) {
     });
 }
 
-// Write the same message back to the client.
-function respond(conn, cmd) {
-    conn.write(cmd);
-}
-
 // Application entry point.
 function main() {
     const { host, port } = setupFlags();
 
-    console.log("Starting TCP Echo Server...");
+    console.log("Starting Redis-like Server (PING support)...");
 
     RunSyncTcpServer(host, port);
 }
