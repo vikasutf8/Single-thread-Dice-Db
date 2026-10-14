@@ -151,4 +151,18 @@ Received cmd: PING []
 Received cmd: PING ["vikas"]
 Received cmd: PING []
 Received cmd: PING ["hello"]
-``
+```
+
+```
+➜  tcp-echo-server-js git:(main) ✗ nc 127.0.0.1 8080
+PING
++PONG
+PING vikas
+$5
+vikas
+PING
+PING hello
+PING hello vikas+PONG
+$5
+hello
+```
