@@ -189,3 +189,51 @@ intentionally unwired — same shared `store` module, one-line call enables it l
 - `DeleteExpiredKeys()` direct: seeded live + pre-aged keys → expired gone / live kept; all-live store → single pass, returns 0
 - Active proof: `SET k v PX 40`, **zero reads**, wait ~1.2 cron ticks → `store.has("k") === false` (only the cron could remove it)
 - Regression: `node --check` all files + `test-ping.js` + `test-resp-decoder.js` + `test-get-set-ttl.js` green; append run to `load_test.md`
+
+## 12. Eviction policy — simple FIRST eviction (no LRU/LFU approx)
+
+Simplest possible policy: when the cache hits a threshold, iterate the
+unordered `Map` (insertion order = oldest first) and delete from the front.
+No sampling, no frequency counters — LRU/LFU explicitly out of scope.
+
+Thresholds (two triggers, either one fires eviction):
+
+| Trigger | Default | Terminal-test override |
+|---|---|---|
+| max key count (`store.size`) | `20_000` keys | `maxKeys: 10` |
+| max cache bytes (keys + values + per-entry overhead) | `10 MB` | not overridden (see note) |
+
+On breach, after the triggering `put()`:
+
+- count trigger (`size > MAX_KEYS`): delete first `ceil(size * 0.10)` keys (10%).
+- size trigger (`bytes > MAX_BYTES`): delete from the front until freed ≥ 1% of `MAX_BYTES`, or 10% of keys scanned — whichever comes first.
+- log every eviction: `[evict] reason=keys|bytes removed=N size=… bytes=…`.
+
+```js
+// store.js
+let MAX_KEYS = 20_000, MAX_BYTES = 10 * 1024 * 1024;
+function configureEviction({ maxKeys, maxBytes } = {}) { … } // server startup / tests
+function evictIfNeeded() { … }                              // called at end of put()
+function evictFirstKeys(n) { … }                            // delete n oldest-inserted
+```
+
+Size accounting: `currentBytes` maintained incrementally — `put` adds
+`byteLength(key) + byteLength(value) + 64 (entry overhead, approximation)`,
+every delete path (`del`, lazy `get`, `expireSample`, `DeleteExpiredKeys`)
+subtracts via one shared `trackDelete()`. `setExpire` changes no bytes.
+
+Wiring: `RunAsyncTcpServer(host, port, { maxKeys, maxCacheBytes })` calls
+`configureEviction()` at startup (sync `main.js` inherits the check free via
+shared `put()`). Terminal test:
+
+```bash
+node -e 'require("./async.tcp.js").RunAsyncTcpServer("127.0.0.1",8081,{maxKeys:10})'
+# nc: SET k1..k11 → 11th SET evicts first 2 (10% of 11); GET k1 → $-1, GET k11 → value
+```
+
+NOTE: the 10 MB path is coded (with comments) but has NO automated test —
+filling 10 MB in unit tests is slow/flaky; verify by reasoning + the shared
+`evictFirstKeys` path it uses. `test-evict.js` covers the count path only
+(small `maxKeys`, assert oldest 10% gone, newest kept, no-evict below limit).
+
+![alt text](image-2.png)

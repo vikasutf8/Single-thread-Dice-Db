@@ -38,7 +38,7 @@
 const net = require("node:net");
 const { readCmd } = require("./redis-cmd");
 const { evalAndRespond, respondError } = require("./eval");
-const { DeleteExpiredKeys } = require("./store");
+const { DeleteExpiredKeys, configureEviction } = require("./store");
 
 // --- epoll constants (mirrored for teaching; used as flags in registry) ---
 const EPOLLIN = 0x001;
@@ -158,6 +158,12 @@ function RunAsyncTcpServer(host, port, opts = {}) {
     const maxBuffer = opts.maxBufferPerClient ?? DEFAULT_MAX_BUFFER_PER_CLIENT;
     const backlog = opts.backlog ?? maxClients; // Listen(fd, backlog=maxClients)
     const cronFrequency = opts.cronFrequency ?? DEFAULT_CRON_FREQUENCY_MS;
+
+    // Eviction thresholds: defaults 20k keys / 10 MB; terminal demos and
+    // tests shrink them, e.g. { maxKeys: 10 }.
+    if (opts.maxKeys !== undefined || opts.maxCacheBytes !== undefined) {
+        configureEviction({ maxKeys: opts.maxKeys, maxBytes: opts.maxCacheBytes });
+    }
 
     parseIP(host); // Bind step validation (real bind happens in listen)
 

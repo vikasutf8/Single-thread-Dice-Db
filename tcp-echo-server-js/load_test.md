@@ -80,3 +80,22 @@ test-resp-decoder.js:  35 passed, 0 failed
 ```
 
 - Result: PASS — 126/126 across all suites, no regressions.
+
+## Run — 2026-10-14 16:36:08 UTC
+
+- Change under test: simple FIRST eviction (thresholds 20k keys / 10 MB; breach → drop oldest-inserted 10%). 10 MB path coded, not unit-tested.
+- Unit/integration suites:
+
+```text
+test-evict.js:         13 passed, 0 failed  (byte accounting, maxKeys=10: 11th SET evicts k1,k2,
+                                              newest kept, wire GET evicted -> $-1)
+test-del-expire.js:    37 passed, 0 failed
+test-get-set-ttl.js:   34 passed, 0 failed
+test-ping.js:          20 passed, 0 failed
+test-resp-decoder.js:  35 passed, 0 failed
+```
+
+- Terminal-path check (`RunAsyncTcpServer("127.0.0.1",18083,{maxKeys:10})`, 11 SETs over TCP):
+  - server log: `[evict] reason=keys removed=2 size=9 bytes=616`
+  - client: 11× `+OK`, `GET k1` → `$-1`, `GET k11` → `$3 v11`
+- Result: PASS — 139/139 across all suites, no regressions.
