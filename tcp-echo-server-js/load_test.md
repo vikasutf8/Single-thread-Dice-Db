@@ -64,3 +64,19 @@ server stats: {"active":0,"accepted":3,"rejected":0,"monitored":0}
 - Result: PASS — all replies correct, `active` back to 0, `monitored_fds` 0 (no fd leak).
 - Note: an early client2 run failed with `-ERR syntax error` because the
   test script sent `*4` for 5-element `SET tmp val EX 60`; fixed to `*5`, server behaved correctly throughout.
+
+## Run — 2026-10-14 16:27:30 UTC
+
+- Change under test: `DEL` / `EXPIRE` / `PEXPIRE` + active-expiry cron in async server (`cronFrequency` 1 s, `lastCronExecution` stamped per tick)
+- Unit/integration suites (no `redis-benchmark` installed on this box):
+
+```text
+test-del-expire.js:    37 passed, 0 failed  (DEL counts, EXPIRE/PEXPIRE incl. 0/negative→delete+:1,
+                                             DeleteExpiredKeys frac loop, live cron proof:
+                                             PX 50 key vanished with zero reads, "[cron] expired 1 keys")
+test-get-set-ttl.js:   34 passed, 0 failed
+test-ping.js:          20 passed, 0 failed
+test-resp-decoder.js:  35 passed, 0 failed
+```
+
+- Result: PASS — 126/126 across all suites, no regressions.

@@ -115,3 +115,77 @@ still passes — plus a new no-double-write assertion in the TTL test file.
 - Dispatch: `evalAndRespond({Cmd:"SET"…})` / `GET` / `TTL` (+ lowercase) each produce **exactly one** write
 - Regression: `node test-ping.js`, `node test-resp-decoder.js`, `node --check` all files
 ![alt text](image-1.png)
+
+## 8. `evalDEL(args, conn)` — `DEL key [key ...]` → `:deleted-count`
+
+- `args.length < 1` → `wrong number of arguments for 'del' command`
+- per key: `get(k) !== null` (lazy `get` treats expired as absent) → raw `store.delete(k)` + `count++`
+- reply `EncodeInteger(count)` — `:0` when nothing deleted (not an error)
+
+```text
+SET a 1 + SET b 2  -> +OK +OK
+DEL a b missing    -> :2
+DEL missing        -> :0
+DEL                -> -ERR wrong number of arguments for 'del' command
+```
+
+## 9. `evalEXPIRE` / `evalPEXPIRE` — `EXPIRE key seconds` / `PEXPIRE key ms` → `:1` / `:0`
+
+Both share one parser; EX multiplies seconds × 1000. Errors (reply `-ERR …`, connection stays open):
+
+| Condition | Message |
+|---|---|
+| `args.length !== 2` | `wrong number of arguments for 'expire' command` (`'pexpire'` for PEXPIRE) |
+| value not an integer | `value is not an integer or out of range` |
+| key missing **or already expired** | `:0` (not an error — real Redis) |
+| value `<= 0` | delete key immediately, `:1` (real Redis) |
+
+Success: `setExpire(key, ms)` keeps the value, sets `expireAt = now + ms`; reply `:1`. Afterwards `TTL key` ≈ requested seconds.
+
+```text
+SET k v          -> +OK
+EXPIRE k 100     -> :1
+TTL k            -> :100
+EXPIRE nokey 10  -> :0
+EXPIRE k 0       -> :1   (k gone; GET k -> $-1)
+```
+
+## 10. Active expiry cron (single-threaded, Redis-style)
+
+Lazy `get()` alone leaves never-read dead keys in memory forever. The async
+server therefore sweeps on a timer (Go: `serverCron` → `activeExpireCycle`;
+here: `setInterval` in `RunAsyncTcpServer`, next to the stats timer):
+
+```js
+const DEFAULT_CRON_FREQUENCY_MS = 1000;   // 1 s, 1 run (real Redis: 10 Hz)
+let lastCronExecution = 0;                // epoch-ms of last sweep
+const cronTimer = setInterval(() => {
+    const deleted = DeleteExpiredKeys();  // core sweep (store.js)
+    lastCronExecution = Date.now();
+    if (deleted > 0) console.log(`[cron] expired ${deleted} keys`);
+}, opts.cronFrequency ?? DEFAULT_CRON_FREQUENCY_MS);
+cronTimer.unref();                        // never keep the process alive
+// clearInterval(cronTimer) on server close; lastCronExecution in stats()
+```
+
+`store.js` additions:
+
+| Function | Behaviour |
+|---|---|
+| `setExpire(key, durationMs)` | `get(key)` first (lazy-cleans) → `null` returns `false`; else mutate live `Obj.expireAt = Date.now() + ms`, return `true` |
+| `expireSample()` | scan unordered `Map`, take up to `EXPIRE_SAMPLE_SIZE = 20` keys with `expireAt !== -1`, delete the expired ones → `{ sampled, expired }` |
+| `DeleteExpiredKeys()` | `loop { s = expireSample(); if (s.sampled === 0) break; frac = s.expired / s.sampled; log; if (frac < 0.25) break; }` (max 3 passes/tick to bound single-thread block time) → total deleted |
+
+Why sample + `frac < 0.25` break (not full scan): a full `Map` scan every
+second is O(n) on the event loop and stalls all 20k clients at large key
+counts. Sampling 20 keeps each tick O(1); repeating while `frac >= 0.25`
+sweeps harder exactly when many keys are dying. `main.js` (sync) is
+intentionally unwired — same shared `store` module, one-line call enables it later.
+
+## 11. Test plan (`test-del-expire.js`)
+
+- DEL: `DEL a b missing` → `:2`; all-missing → `:0`; 0 args → error; expired key → counts 0; dispatch single-write
+- EXPIRE/PEXPIRE: happy `:1` + visible via `TTL`; missing → `:0`; `abc` → not-integer; `0`/`-5` → key gone + `:1`; wrong arg counts
+- `DeleteExpiredKeys()` direct: seeded live + pre-aged keys → expired gone / live kept; all-live store → single pass, returns 0
+- Active proof: `SET k v PX 40`, **zero reads**, wait ~1.2 cron ticks → `store.has("k") === false` (only the cron could remove it)
+- Regression: `node --check` all files + `test-ping.js` + `test-resp-decoder.js` + `test-get-set-ttl.js` green; append run to `load_test.md`

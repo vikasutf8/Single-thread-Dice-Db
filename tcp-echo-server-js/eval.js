@@ -5,14 +5,15 @@
 //         └── evalAndRespond(cmd, conn)
 //               ├── switch cmd.Cmd: "PING" → evalPING, "SET" → evalSET,
 //               │                   "GET" → evalGET, "TTL" → evalTTL,
-//               │                   default → evalDefault
+//               │                   "DEL" → evalDEL, "EXPIRE" → evalEXPIRE,
+//               │                   "PEXPIRE" → evalPEXPIRE, default → evalDefault
 //
 // Each eval*() writes its own reply (conn.write) and returns the Buffer.
 // evalAndRespond only dispatches — it must NOT write again (double-write
 // would corrupt pipelined streams, e.g. redis-benchmark).
 
 const { EncodeSimpleString, EncodeBulkString, EncodeError, EncodeInteger } = require("./resp-encoder");
-const { newObj, put, get } = require("./store");
+const { newObj, put, get, del, setExpire } = require("./store");
 
 // Any failure is written back as a RESP error so the connection stays open.
 function respondError(err, conn) {
@@ -125,6 +126,59 @@ function evalTTL(args, conn) {
     return out;
 }
 
+// DEL key [key ...] → :deleted-count (:0 when nothing deleted, not an error)
+function evalDEL(args, conn) {
+    let out;
+    if (!Array.isArray(args) || args.length < 1) {
+        out = EncodeError("wrong number of arguments for 'del' command");
+    } else {
+        let count = 0;
+        for (const key of args) {
+            if (get(key) !== null && del(key)) count++; // lazy get: expired counts as absent
+        }
+        out = EncodeInteger(count);
+    }
+    if (conn && typeof conn.write === "function") conn.write(out);
+    return out;
+}
+
+// Shared EXPIRE/PEXPIRE parser. isMillis=false → seconds × 1000.
+// Missing/expired key → :0; value <= 0 → delete now, :1 (real Redis).
+function evalExpirelike(args, conn, cmdName, isMillis) {
+    const lname = cmdName.toLowerCase();
+    let out;
+    if (!Array.isArray(args) || args.length !== 2) {
+        out = EncodeError(`wrong number of arguments for '${lname}' command`);
+    } else if (!/^-?\d+$/.test(String(args[1]))) {
+        out = EncodeError("value is not an integer or out of range");
+    } else {
+        const n = Number(args[1]);
+        if (!Number.isSafeInteger(n)) {
+            out = EncodeError("value is not an integer or out of range");
+        } else if (get(args[0]) === null) {
+            out = EncodeInteger(0);
+        } else if (n <= 0) {
+            del(args[0]);
+            out = EncodeInteger(1);
+        } else {
+            setExpire(args[0], isMillis ? n : n * 1000);
+            out = EncodeInteger(1);
+        }
+    }
+    if (conn && typeof conn.write === "function") conn.write(out);
+    return out;
+}
+
+// EXPIRE key seconds → :1 timeout set / :0 key missing
+function evalEXPIRE(args, conn) {
+    return evalExpirelike(args, conn, "EXPIRE", false);
+}
+
+// PEXPIRE key milliseconds → :1 timeout set / :0 key missing
+function evalPEXPIRE(args, conn) {
+    return evalExpirelike(args, conn, "PEXPIRE", true);
+}
+
 // Entry: dispatch on upper-cased Cmd. Never throws.
 // Each eval*() already did the single conn.write — no write here.
 function evalAndRespond(redisCmd, conn) {
@@ -146,6 +200,15 @@ function evalAndRespond(redisCmd, conn) {
         case "TTL":
             evalTTL(args, conn);
             break;
+        case "DEL":
+            evalDEL(args, conn);
+            break;
+        case "EXPIRE":
+            evalEXPIRE(args, conn);
+            break;
+        case "PEXPIRE":
+            evalPEXPIRE(args, conn);
+            break;
         default:
             evalDefault(redisCmd, conn);
             break;
@@ -163,6 +226,9 @@ module.exports = {
     evalSET,
     evalGET,
     evalTTL,
+    evalDEL,
+    evalEXPIRE,
+    evalPEXPIRE,
     evalDefault,
     evalAndRespond,
     respondError,

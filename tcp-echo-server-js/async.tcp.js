@@ -38,6 +38,7 @@
 const net = require("node:net");
 const { readCmd } = require("./redis-cmd");
 const { evalAndRespond, respondError } = require("./eval");
+const { DeleteExpiredKeys } = require("./store");
 
 // --- epoll constants (mirrored for teaching; used as flags in registry) ---
 const EPOLLIN = 0x001;
@@ -46,10 +47,12 @@ const EPOLL_CTL_DEL = 2;
 
 const DEFAULT_MAX_CLIENTS = 20000; // your spec: 20k cap
 const DEFAULT_MAX_BUFFER_PER_CLIENT = 1 << 20; // 1 MiB leftover cap per fd
+const DEFAULT_CRON_FREQUENCY_MS = 1000; // active-expiry tick: 1 s, 1 run (real Redis: 10 Hz)
 
 let concurrentClients = 0;
 let totalAccepted = 0;
 let totalRejected = 0;
+let lastCronExecution = 0; // epoch-ms of the last expiry sweep
 let nextFd = 100; // fake fd numbers for logging (real fd hidden inside libuv)
 
 // fd registry == epoll interest list: fd -> FdComm { fd, socket, leftover, addr }
@@ -154,6 +157,7 @@ function RunAsyncTcpServer(host, port, opts = {}) {
     const maxClients = opts.maxClients ?? DEFAULT_MAX_CLIENTS;
     const maxBuffer = opts.maxBufferPerClient ?? DEFAULT_MAX_BUFFER_PER_CLIENT;
     const backlog = opts.backlog ?? maxClients; // Listen(fd, backlog=maxClients)
+    const cronFrequency = opts.cronFrequency ?? DEFAULT_CRON_FREQUENCY_MS;
 
     parseIP(host); // Bind step validation (real bind happens in listen)
 
@@ -230,6 +234,16 @@ function RunAsyncTcpServer(host, port, opts = {}) {
     }, 30_000);
     statTimer.unref();
 
+    // Active-expiry cron (Go: serverCron → activeExpireCycle).
+    // Same single thread as the EPOLLIN dispatch: each tick sweeps expired
+    // keys via core DeleteExpiredKeys(), then stamps lastCronExecution.
+    const cronTimer = setInterval(() => {
+        const deleted = DeleteExpiredKeys();
+        lastCronExecution = Date.now();
+        if (deleted > 0) console.log(`[cron] expired ${deleted} keys`);
+    }, cronFrequency);
+    cronTimer.unref();
+
     return {
         server,
         stats: () => ({
@@ -237,8 +251,13 @@ function RunAsyncTcpServer(host, port, opts = {}) {
             accepted: totalAccepted,
             rejected: totalRejected,
             monitored: fdRegistry.size,
+            lastCronExecution,
         }),
-        close: (cb) => server.close(cb),
+        close: (cb) => {
+            clearInterval(cronTimer);
+            clearInterval(statTimer);
+            server.close(cb);
+        },
     };
 }
 
@@ -248,4 +267,5 @@ module.exports = {
     EPOLL_CTL_ADD,
     EPOLL_CTL_DEL,
     DEFAULT_MAX_CLIENTS,
+    DEFAULT_CRON_FREQUENCY_MS,
 };
