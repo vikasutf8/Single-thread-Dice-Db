@@ -45,3 +45,22 @@ tail -20 load_test.md
 ## Results log (append below this line)
 
 <!-- New runs go below. Do not edit entries above. -->
+
+## Run — 2026-10-14 16:06:49 UTC
+
+- Server: async (`RunAsyncTcpServer("127.0.0.1", 8081)`), 1 server × 3 concurrent scripted clients
+- Client scripts (RESP over TCP):
+  - client1: `PING`, `SET name vikas`, `GET name`
+  - client2: `SET tmp val EX 60`, `TTL tmp`, `GET tmp`
+  - client3: `GET nokey`, `TTL nokey`, `PING hello`
+
+```text
+client1: "+PONG\r\n+OK\r\n$5\r\nvikas\r\n"
+client2: "+OK\r\n:60\r\n$3\r\nval\r\n"
+client3: "$-1\r\n:-2\r\n$5\r\nhello\r\n"
+server stats: {"active":0,"accepted":3,"rejected":0,"monitored":0}
+```
+
+- Result: PASS — all replies correct, `active` back to 0, `monitored_fds` 0 (no fd leak).
+- Note: an early client2 run failed with `-ERR syntax error` because the
+  test script sent `*4` for 5-element `SET tmp val EX 60`; fixed to `*5`, server behaved correctly throughout.
