@@ -99,3 +99,44 @@ test-resp-decoder.js:  35 passed, 0 failed
   - server log: `[evict] reason=keys removed=2 size=9 bytes=616`
   - client: 11× `+OK`, `GET k1` → `$-1`, `GET k11` → `$3 v11`
 - Result: PASS — 139/139 across all suites, no regressions.
+
+## Run — 2026-10-15 15:09:40 UTC
+
+- Change under test: Redis pipeline — 1 round trip, N cmds, N replies
+  (`async.tcp.js:readFromClient` wrapped in `conn.cork()`/`uncork()` so one
+  EPOLLIN hit flushes all replies together; pipeline != transaction, no
+  atomicity — see `pipeline.md`). No codec/eval/store changes.
+- Basic + regression suites:
+
+```text
+test-pipeline.js:      21 passed, 0 failed  (4-in-1 PING+SET+GET+PING one write;
+                                             error mid-batch neither rolls back
+                                             nor stops; unknown FOO mid-batch;
+                                             split-packet batch; stats depth 10;
+                                             mixed SET-EX+EXPIRE+TTL+GET)
+test-ping.js:          20 passed, 0 failed
+test-resp-decoder.js:  35 passed, 0 failed
+test-get-set-ttl.js:   34 passed, 0 failed
+test-del-expire.js:    37 passed, 0 failed
+test-evict.js:         13 passed, 0 failed
+```
+
+- Load test (no `redis-benchmark` on this box; scripted RESP-over-TCP
+  equivalent — single-write pipelined batches, replies verified in order):
+
+```text
+Round A (mixed): 50 conns x 20-cmd batches (PING/SET alternating, ONE write
+  each) + 1 x 200-PING mega-pipeline
+  -> okConns=50/50 okReplies=1000 bad=0; MEGA pong=200/200
+  -> TOTAL 1200 cmds in 218ms = 5505 cmds/s
+  -> stats {"active":0,"accepted":51,"rejected":0,"monitored":0,
+            "commands":1200,"batches":51,"maxBatchDepth":200}
+Round B (burst): 200 conns x 10-PING batches, ONE write each
+  -> ok=200/200 bad=0, 2000 cmds in 244ms = 8197 cmds/s
+  -> stats {"active":0,"accepted":200,"rejected":0,"monitored":0,
+            "commands":2000,"batches":200,"maxBatchDepth":10}
+```
+
+- Result: PASS — 160/160 (139 regression + 21 pipeline), 3200 pipelined
+  cmds over 251 conns with zero failures, `active` back to 0, `monitored` 0
+  (no fd leak). `maxBatchDepth=200` proves single-hit batch execution.

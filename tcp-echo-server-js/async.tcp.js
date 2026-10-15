@@ -52,6 +52,9 @@ const DEFAULT_CRON_FREQUENCY_MS = 1000; // active-expiry tick: 1 s, 1 run (real 
 let concurrentClients = 0;
 let totalAccepted = 0;
 let totalRejected = 0;
+let totalCommands = 0; // all cmds executed, incl. pipelined
+let totalBatches = 0; // EPOLLIN hits that carried >=1 complete cmd
+let maxBatchDepth = 0; // largest cmds-per-hit seen (pipeline depth proof)
 let lastCronExecution = 0; // epoch-ms of the last expiry sweep
 let nextFd = 100; // fake fd numbers for logging (real fd hidden inside libuv)
 
@@ -95,47 +98,75 @@ function parseIP(host) {
 //   for { cmd = readCmd(buf); on incomplete break&wait-more;
 //         on EXIT/quit break&close; on disconnect break&close;
 //         else evalAndRespond(PING) }
-// Called on every EPOLLIN hit (socket 'data' event) with whatever bytes
-// arrived; drains every complete RedisCmd already buffered.
+//
+// PIPELINE (not a transaction):
+//   N complete RedisCmds already buffered in ONE EPOLLIN hit are executed
+//   strictly one-by-one, in order, with NO atomicity / rollback / queueing.
+//   If cmd #2 fails, #1 stays applied and #3 still runs. Replies are
+//   concatenated back-to-back on the wire so the client gets them in a
+//   single round trip: 1 request (N cmds, 1 write) -> 1 response (N replies).
+//   No PIPELINE/MULTI/EXEC verb exists on the server — batching is purely
+//   a transport shape the client chooses.
+//
+//   conn.cork()/uncork() wraps the drain so the N conn.write() calls made
+//   by evalAndRespond coalesce into one TCP flush ("return all in once").
+//   Called on every EPOLLIN hit (socket 'data' event) with whatever bytes
+//   arrived; drains every complete RedisCmd already buffered.
 // ---------------------------------------------------------------------------
 function readFromClient(fdComm) {
     const conn = fdComm.socket;
+    let batchDepth = 0;
 
-    while (fdComm.leftover.length > 0) {
-        const { cmd, n, err } = readCmd(fdComm.leftover);
+    // Cork: buffer kernel writes until uncork -> single flush per hit.
+    if (typeof conn.cork === "function") conn.cork();
+    try {
+        while (fdComm.leftover.length > 0) {
+            const { cmd, n, err } = readCmd(fdComm.leftover);
 
-        if (err) {
-            // Incomplete RESP frame: keep bytes, break, wait for next EPOLLIN.
-            if (err.message.startsWith("incomplete")) break;
-            // Bare Enter from nc: consume line, keep connection open.
-            if (err.message === "empty line") {
-                fdComm.leftover = fdComm.leftover.slice(n);
+            if (err) {
+                // Incomplete RESP frame: keep bytes, break, wait for next EPOLLIN.
+                if (err.message.startsWith("incomplete")) break;
+                // Bare Enter from nc: consume line, keep connection open.
+                if (err.message === "empty line") {
+                    fdComm.leftover = fdComm.leftover.slice(n);
+                    if (fdComm.leftover.length === 0) break;
+                    continue;
+                }
+                // Protocol error: reply -ERR, drop bad bytes, keep connection.
+                // Pipeline keeps going: error is one reply in the batch.
+                respondError(err, conn);
+                fdComm.leftover = n > 0 ? fdComm.leftover.slice(n) : Buffer.alloc(0);
                 if (fdComm.leftover.length === 0) break;
                 continue;
             }
-            // Protocol error: reply -ERR, drop bad bytes, keep connection.
-            respondError(err, conn);
-            fdComm.leftover = n > 0 ? fdComm.leftover.slice(n) : Buffer.alloc(0);
-            if (fdComm.leftover.length === 0) break;
-            continue;
+
+            // EXIT / QUIT breaks the inner loop and closes this fd (your spec).
+            const verb = String(cmd.Cmd).toUpperCase();
+            if (verb === "EXIT" || verb === "QUIT") {
+                conn.end();
+                break;
+            }
+
+            // Pipeline step: execute now, in order, no queueing.
+            evalAndRespond(cmd, conn);
+            totalCommands++;
+            batchDepth++;
+            fdComm.leftover = fdComm.leftover.slice(n);
         }
 
-        // EXIT / QUIT breaks the inner loop and closes this fd (your spec).
-        const verb = String(cmd.Cmd).toUpperCase();
-        if (verb === "EXIT" || verb === "QUIT") {
-            conn.end();
-            break;
+        if (batchDepth > 0) {
+            totalBatches++;
+            if (batchDepth > maxBatchDepth) maxBatchDepth = batchDepth;
         }
 
-        // Same respond path as sync server: PING -> evalPING else evalDefault.
-        evalAndRespond(cmd, conn);
-        fdComm.leftover = fdComm.leftover.slice(n);
-    }
-
-    // Per-fd memory guard: at 10k clients one 100MB leftover kills the box.
-    if (fdComm.leftover.length > fdComm.maxBuffer) {
-        respondError(new Error("too much pipelined data, closing"), conn);
-        conn.destroy();
+        // Per-fd memory guard: at 10k clients one 100MB leftover kills the box.
+        if (fdComm.leftover.length > fdComm.maxBuffer) {
+            respondError(new Error("too much pipelined data, closing"), conn);
+            conn.destroy();
+        }
+    } finally {
+        // Single flush: all N replies from this hit go out together.
+        if (typeof conn.uncork === "function") conn.uncork();
     }
 }
 
@@ -257,6 +288,9 @@ function RunAsyncTcpServer(host, port, opts = {}) {
             accepted: totalAccepted,
             rejected: totalRejected,
             monitored: fdRegistry.size,
+            commands: totalCommands,
+            batches: totalBatches,
+            maxBatchDepth,
             lastCronExecution,
         }),
         close: (cb) => {
