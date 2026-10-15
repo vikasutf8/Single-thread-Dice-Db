@@ -11,7 +11,7 @@ const assert = require("node:assert");
 const { readCmd } = require("./redis-cmd");
 const { Decode } = require("./resp-decoder");
 const { evalAndRespond } = require("./eval");
-const { put, get, newObj, clearStore } = require("./store");
+const { put, get, newObj, newObjAbs, clearStore } = require("./store");
 const aof = require("./aof");
 const rdb = require("./rdb");
 
@@ -97,7 +97,7 @@ async function main() {
         clearStore();
         put("plain", newObj("a", -1));
         put("ttl", newObj("b", 60000));
-        put("gone", { value: "x", expireAt: Date.now() - 1000 }); // already dead
+        put("gone", newObjAbs("x", Date.now() - 1000)); // already dead
         const r = aof.dumpAllAOF(p);
         ok("dump skips expired", r.keys === 2, `keys=${r.keys}`);
         clearStore();
@@ -138,12 +138,12 @@ async function main() {
         const s = rdb.dumpRDBSync(p);
         ok("rdb save", s.ok && s.keys === 2, JSON.stringify(s));
         const magic = fs.readFileSync(p).slice(0, 4).toString();
-        ok("rdb magic", magic === "RDB1");
+        ok("rdb magic", magic === "RDB2");
         clearStore();
         const l = rdb.loadRDB(p);
         ok("rdb load", l.loaded === 2 && get("rk").value === "rv" && get("rt").value === "rv2");
         // expired at save time never enters the snapshot
-        put("old", { value: "z", expireAt: Date.now() - 10 });
+        put("old", newObjAbs("z", Date.now() - 10));
         rdb.dumpRDBSync(p);
         clearStore();
         const l2 = rdb.loadRDB(p);

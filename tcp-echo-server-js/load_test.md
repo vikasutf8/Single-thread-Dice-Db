@@ -183,3 +183,84 @@ stats {"active":0,"accepted":200,"rejected":0,"monitored":0,
 - Result: PASS — 192/192 (160 regression + 32 persistence), restart
   recovery proven over real TCP for both engines, `active` back to 0,
   `monitored` 0 (no fd leak), repo has zero stray `*.aof`/`*.rdb` files.
+
+## Run — 2026-10-15 16:10:00 UTC
+
+- Change under test: `diceObj` — store values grow `{value, expireAt}` →
+  `{value, expireAt, typeEncoding}` (redisObject layout: type high nibble,
+  encoding low nibble; `OBJ_TYPE_STRING`, `RAW`/`INT`/`EMBSTR` + `getType` /
+  `getEncoding` / `assertType` / `assertEncoding` / `autoEncoding` /
+  `newObjAbs`). RDB bumped to `RDB2` (one `u8 typeEncoding` per entry,
+  legacy RDB1 still loads). `GET`/`TTL` answer `-WRONGTYPE` on type
+  mismatch (see `diceobj.md`).
+- Basic + regression suites:
+
+```text
+test-diceobj.js:       38 passed, 0 failed  (pack/unpack nibbles + masking;
+                                             legacy defaults; auto INT/EMBSTR/
+                                             RAW incl. 44B edge; stamping;
+                                             asserts incl. WRONGTYPE verbatim;
+                                             SET stamps INT, wrong-type GET/
+                                             TTL -> -WRONGTYPE, conn survives;
+                                             RDB2 byte-exact encodings;
+                                             hand-built RDB1 loads)
+test-ping.js:          20 passed, 0 failed
+test-resp-decoder.js:  35 passed, 0 failed
+test-get-set-ttl.js:   34 passed, 0 failed
+test-del-expire.js:    37 passed, 0 failed
+test-evict.js:         13 passed, 0 failed
+test-pipeline.js:      21 passed, 0 failed
+test-aof-rdb.js:       32 passed, 0 failed
+```
+
+- Load test (no persistence enabled; 200 conns x 10-cmd PING/SET batches,
+  ONE write each — encoding stamp is on the SET path):
+
+```text
+BURST conns=200 depth=10 ok=200/200 bad=0, 2000 cmds in 247ms = 8097 cmds/s
+stats {"active":0,"accepted":200,"rejected":0,"monitored":0,
+       "commands":2000,"batches":200,"maxBatchDepth":10}
+```
+
+- Baseline before diceObj: 8197 cmds/s. No perf regression (one byte pack
+  per SET is noise).
+- Result: PASS — 230/230 (192 regression + 38 diceobj), `active` back to 0,
+  `monitored` 0 (no fd leak).
+
+## Run — 2026-10-15 16:30:00 UTC
+
+- Change under test: `evalINCR` (`INCR key` → `:n`) + `deduceTypeEncoding`
+  (tryObjectEncoding port) used by `SET`/`INCR` before storing. Missing/
+  expired → `:1`; non-int/unsafe-int → not-an-integer; `MAX_SAFE_INTEGER`
+  → overflow error; TTL preserved; encoding re-deduced on every write;
+  AOF logs `INCR` verbatim (see `redis_cmd_impl.md` §13).
+- Basic + regression suites:
+
+```text
+test-incr.js:          21 passed, 0 failed  (missing -> :1 + INT stamp;
+                                            41 -> :42 -> :43; -1 -> :0;
+                                            non-int/unsafe/overflow/arity;
+                                            expired -> :1; TTL preserved;
+                                            WRONGTYPE; lowercase; AOF replay
+                                            SET 5 + INCR x2 -> "7")
+test-diceobj.js:       42 passed, 0 failed  (+ deduceTypeEncoding trio,
+                                            + SET type-stamp check)
+test-ping.js:          20 passed, 0 failed
+test-resp-decoder.js:  35 passed, 0 failed
+test-get-set-ttl.js:   34 passed, 0 failed
+test-del-expire.js:    37 passed, 0 failed
+test-evict.js:         13 passed, 0 failed
+test-pipeline.js:      21 passed, 0 failed
+test-aof-rdb.js:       32 passed, 0 failed
+```
+
+- Load test (100 conns x pipeline of 1 SET-0 + 20 INCR, ONE write each;
+  final reply per conn must be exactly `:20`):
+
+```text
+INCR-BURST conns=100 incr-per-conn=20 ok=100/100 bad=0, 2100 cmds in 234ms = 8974 cmds/s
+stats {"active":0,"accepted":100,"monitored":0,"commands":2100,"maxBatchDepth":21}
+```
+
+- Result: PASS — 255/255 (234 regression + 21 incr), read-modify-write
+  batches exact under concurrency, `active` back to 0, `monitored` 0.

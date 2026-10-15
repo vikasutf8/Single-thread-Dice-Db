@@ -3,10 +3,83 @@
 // In-memory key/value store — Go study ported to Node.js.
 // Go: var store map[string]*Obj (init in init())
 //     type Obj struct { Value any; ExpireAt int64 }  // ExpireAt = epoch-ms, -1 = persistent
-// Here: store = Map<string, Obj>, Obj = { value, expireAt }.
+// Here: store = Map<string, diceObj>, diceObj = { value, expireAt, typeEncoding }.
 // Expiry is lazy: enforced on get(), no background sweeper.
+//
+// diceObj mirrors Redis's redisObject (robj): one uint8 packs type + encoding:
+//   typeEncoding = [ type: high 4 bits | encoding: low 4 bits ]
+//   getType()     -> shift right 4 (top bits)
+//   getEncoding() -> mask 0x0F (top bits set to zero)
 
 const NO_EXPIRE = -1;
+
+// --- diceObj type codes (robj->type, high 4 bits) ---
+const OBJ_TYPE_STRING = 0;
+
+// --- diceObj encoding codes (robj->encoding, low 4 bits) ---
+const OBJ_ENCODING_RAW = 0; // string value, heap object
+const OBJ_ENCODING_INT = 1; // integer-representable string (compact numeric)
+const OBJ_ENCODING_EMBSTR = 2; // short string (<= EMBSTR_MAX_LEN bytes)
+
+// Redis embstr limit: strings this short live inside the object itself.
+const EMBSTR_MAX_LEN = 44;
+
+// packTypeEncoding(otype, oEnc): one uint8, type on top, encoding below.
+function packTypeEncoding(otype, oEnc) {
+    return (((Number(otype) || 0) & 0x0f) << 4) | ((Number(oEnc) || 0) & 0x0f);
+}
+
+// getType(o): first (most significant) 4 bits. Legacy objs without
+// typeEncoding (raw {value, expireAt} literals, RDB1 loads) read as STRING.
+function getType(o) {
+    if (!o || o.typeEncoding === undefined) return OBJ_TYPE_STRING;
+    return (o.typeEncoding >> 4) & 0x0f;
+}
+
+// getEncoding(o): last (least significant) 4 bits — top bits masked to zero.
+// Legacy objs without typeEncoding read as RAW.
+function getEncoding(o) {
+    if (!o || o.typeEncoding === undefined) return OBJ_ENCODING_RAW;
+    return o.typeEncoding & 0x0f;
+}
+
+// assertType(o, expected): throws WRONGTYPE (Redis verbatim) on mismatch.
+// Callers (evalGET/TTL/...) catch this and reply -WRONGTYPE on the wire.
+function assertType(o, expected) {
+    if (getType(o) !== expected) {
+        throw new Error("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+}
+
+// assertEncoding(o, expected): internal guard (encoding is a storage hint,
+// never visible as a wrong-type error to clients).
+function assertEncoding(o, expected) {
+    if (getEncoding(o) !== expected) {
+        throw new Error(
+            `encoding mismatch: expected ${expected}, got ${getEncoding(o)}`
+        );
+    }
+}
+
+// deduceTypeEncoding(value): Redis tryObjectEncoding port — decide the
+// (otype, oEnc) pair for a fresh value before it is stored. SET only ever
+// produces strings, so otype is always OBJ_TYPE_STRING today; the encoding
+// attempt is where the saving happens (INT < EMBSTR < RAW). Future types
+// (LIST/HASH/...) extend the otype branch here, callers stay unchanged.
+function deduceTypeEncoding(value) {
+    return { otype: OBJ_TYPE_STRING, oEnc: autoEncoding(value) };
+}
+
+// autoEncoding(value): Redis string-encoding rule — integers first, then
+// embstr for short strings, raw for the rest.
+function autoEncoding(value) {
+    const s = String(value);
+    if (/^-?\d+$/.test(s)) {
+        const n = Number(s);
+        if (Number.isSafeInteger(n)) return OBJ_ENCODING_INT;
+    }
+    return Buffer.byteLength(s) <= EMBSTR_MAX_LEN ? OBJ_ENCODING_EMBSTR : OBJ_ENCODING_RAW;
+}
 
 // init(): store is ready at module load.
 const store = new Map();
@@ -51,12 +124,24 @@ function trackDelete(key) {
     return true;
 }
 
-// newObj(value, durationMs): durationMs > 0 → dies at now+ms, else persistent.
-function newObj(value, durationMs) {
+// newObj(value, durationMs, otype?, oEnc?): durationMs > 0 → dies at now+ms,
+// else persistent. otype defaults to STRING, oEnc auto-detects (INT/EMBSTR/RAW).
+function newObj(value, durationMs, otype = OBJ_TYPE_STRING, oEnc) {
     const ms = Number(durationMs);
     return {
         value,
         expireAt: Number.isFinite(ms) && ms > 0 ? Date.now() + ms : NO_EXPIRE,
+        typeEncoding: packTypeEncoding(otype, oEnc === undefined ? autoEncoding(value) : oEnc),
+    };
+}
+
+// newObjAbs(value, expireAt, otype?, oEnc?): absolute-expiry twin for loaders
+// (RDB) and tests — expireAt is epoch-ms, -1 = persistent.
+function newObjAbs(value, expireAt, otype = OBJ_TYPE_STRING, oEnc) {
+    return {
+        value,
+        expireAt: Number(expireAt),
+        typeEncoding: packTypeEncoding(otype, oEnc === undefined ? autoEncoding(value) : oEnc),
     };
 }
 
@@ -203,6 +288,7 @@ function clearStore() {
 module.exports = {
     store,
     newObj,
+    newObjAbs,
     put,
     get,
     del,
@@ -214,6 +300,18 @@ module.exports = {
     evictFirstKeys,
     cacheStats,
     clearStore,
+    OBJ_TYPE_STRING,
+    OBJ_ENCODING_RAW,
+    OBJ_ENCODING_INT,
+    OBJ_ENCODING_EMBSTR,
+    EMBSTR_MAX_LEN,
+    packTypeEncoding,
+    getType,
+    getEncoding,
+    assertType,
+    assertEncoding,
+    autoEncoding,
+    deduceTypeEncoding,
     NO_EXPIRE,
     EXPIRE_SAMPLE_SIZE,
     DEFAULT_MAX_KEYS,

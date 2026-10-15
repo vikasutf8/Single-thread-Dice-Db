@@ -6,10 +6,10 @@
 // load; AOF replays on top of it for the commands after the snapshot.
 //
 // Format (all integers big-endian):
-//   magic      4 bytes  "RDB1"
+//   magic      4 bytes  "RDB2" (v1 "RDB1" still loads: entries without type byte)
 //   count      u32      number of entries
-//   per entry: u32 klen + key bytes + u32 vlen + val bytes + i64 expireAtMs
-//              (expireAtMs = -1 => persistent key)
+//   per entry: u32 klen + key bytes + u32 vlen + val bytes +
+//              u8 typeEncoding + i64 expireAtMs (expireAtMs = -1 => persistent)
 // No checksum in v1 — trailing bytes after `count` entries = corrupt file.
 //
 // Node "background": snapshot build over 20k keys is a few ms; the file
@@ -18,10 +18,11 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { put, NO_EXPIRE } = require("./store");
+const { put, newObjAbs, packTypeEncoding, OBJ_TYPE_STRING, OBJ_ENCODING_RAW, NO_EXPIRE } = require("./store");
 
 const DEFAULT_RDB_PATH = path.join(__dirname, "RDB", "dump.rdb");
-const MAGIC = Buffer.from("RDB1", "utf8");
+const MAGIC = Buffer.from("RDB2", "utf8");
+const MAGIC_V1 = Buffer.from("RDB1", "utf8");
 
 let rdbPath = DEFAULT_RDB_PATH;
 let saving = false; // bgEvalRDB in flight
@@ -41,6 +42,7 @@ function lastSave() {
 }
 
 // buildSnapshot() — store -> one Buffer. Skips already-expired keys.
+// Legacy raw objs (no typeEncoding) snapshot as STRING/RAW.
 function buildSnapshot(entries) {
     const now = Date.now();
     const parts = [MAGIC, Buffer.alloc(4)];
@@ -49,12 +51,14 @@ function buildSnapshot(entries) {
         if (obj.expireAt !== NO_EXPIRE && now > obj.expireAt) continue;
         const kb = Buffer.from(String(key), "utf8");
         const vb = Buffer.from(String(obj.value), "utf8");
-        const h = Buffer.alloc(4 + kb.length + 4 + vb.length + 8);
+        const te = obj.typeEncoding ?? packTypeEncoding(OBJ_TYPE_STRING, OBJ_ENCODING_RAW);
+        const h = Buffer.alloc(4 + kb.length + 4 + vb.length + 1 + 8);
         let o = 0;
         h.writeUInt32BE(kb.length, o); o += 4;
         kb.copy(h, o); o += kb.length;
         h.writeUInt32BE(vb.length, o); o += 4;
         vb.copy(h, o); o += vb.length;
+        h.writeUInt8(te, o); o += 1;
         h.writeBigInt64BE(BigInt(obj.expireAt), o);
         parts.push(h);
         count++;
@@ -113,9 +117,10 @@ function loadRDB(filePath, putFn = put) {
         if (err.code === "ENOENT") return { loaded: 0, skipped: 0, noFile: true };
         throw err;
     }
-    if (buf.length < 8 || !buf.slice(0, 4).equals(MAGIC)) {
+    if (buf.length < 8 || (!buf.slice(0, 4).equals(MAGIC) && !buf.slice(0, 4).equals(MAGIC_V1))) {
         throw new Error(`bad rdb magic in ${filePath}`);
     }
+    const v1 = buf.slice(0, 4).equals(MAGIC_V1); // legacy entries carry no type byte
     const count = buf.readUInt32BE(4);
     let o = 8;
     let loaded = 0;
@@ -127,11 +132,19 @@ function loadRDB(filePath, putFn = put) {
         if (o + klen + 4 > buf.length) throw new Error(`truncated rdb key (entry ${i})`);
         const key = buf.slice(o, o + klen).toString("utf8"); o += klen;
         const vlen = buf.readUInt32BE(o); o += 4;
-        if (o + vlen + 8 > buf.length) throw new Error(`truncated rdb val (entry ${i})`);
+        const tailNeed = v1 ? 8 : 1 + 8; // v2 stores u8 typeEncoding before expireAt
+        if (o + vlen + tailNeed > buf.length) throw new Error(`truncated rdb val (entry ${i})`);
         const value = buf.slice(o, o + vlen).toString("utf8"); o += vlen;
+        let otype; // undefined => legacy RDB1 entry => newObjAbs auto-detects
+        let oEnc;
+        if (!v1) {
+            const te = buf.readUInt8(o); o += 1;
+            otype = (te >> 4) & 0x0f;
+            oEnc = te & 0x0f;
+        }
         const expireAt = Number(buf.readBigInt64BE(o)); o += 8;
         if (expireAt !== NO_EXPIRE && now > expireAt) { skipped++; continue; }
-        putFn(key, { value, expireAt });
+        putFn(key, newObjAbs(value, expireAt, otype, oEnc));
         loaded++;
     }
     if (o !== buf.length) throw new Error(`trailing bytes in ${filePath}`);
@@ -148,4 +161,6 @@ module.exports = {
     bgEvalRDB,
     loadRDB,
     DEFAULT_RDB_PATH,
+    MAGIC,
+    MAGIC_V1,
 };

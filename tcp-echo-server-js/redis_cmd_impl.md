@@ -23,17 +23,25 @@ The dispatcher does **not** write again (see §6 drive-by fix).
 ## 2. Store (`store.js`, new file)
 
 ```js
-// Obj struct: { value: string, expireAt: number }
+// diceObj struct (redisObject port): { value: string, expireAt: number, typeEncoding: uint8 }
 //   expireAt = epoch-ms when the key dies, -1 = persistent (no expiry).
-// store: Map<string, Obj>, created once at module load (init).
+//   typeEncoding = [ type: high 4 bits | encoding: low 4 bits ] (robj layout).
+//   type: OBJ_TYPE_STRING (0). encoding: RAW (0) | INT (1) | EMBSTR (2, ≤44 B).
+// store: Map<string, diceObj>, created once at module load (init).
 ```
 
 | Function | Signature | Behaviour |
 |---|---|---|
-| `newObj` | `(value, durationMs) -> Obj` | `durationMs > 0` → `expireAt = Date.now() + durationMs`, else `expireAt = -1` |
-| `put` | `(key, obj) -> void` | `store.set(key, obj)` (overwrite) |
-| `get` | `(key) -> Obj \| null` | missing → `null`; **expired** (`expireAt !== -1 && Date.now() > expireAt`) → lazy `delete` + `null`; else the `Obj` |
+| `newObj` | `(value, durationMs, otype=STRING, oEnc=auto) -> diceObj` | `durationMs > 0` → `expireAt = Date.now() + durationMs`, else `expireAt = -1`; encoding auto-detects (int → INT, ≤44 B → EMBSTR, else RAW) unless passed |
+| `newObjAbs` | `(value, expireAt, otype=STRING, oEnc=auto) -> diceObj` | absolute-expiry twin for loaders (RDB) and tests |
+| `packTypeEncoding` | `(otype, oEnc) -> uint8` | `(otype & 0x0F) << 4 \| (oEnc & 0x0F)` |
+| `getType` / `getEncoding` | `(diceObj) -> nibble` | `(byte >> 4) & 0x0F` / `byte & 0x0F`; legacy objs without the byte read as STRING / RAW |
+| `assertType` / `assertEncoding` | `(diceObj, expected)` | throw on mismatch (`WRONGTYPE …` for type); `GET`/`TTL`/`INCR` catch → `-WRONGTYPE` on the wire |
+| `deduceTypeEncoding` | `(value) -> { otype, oEnc }` | Redis `tryObjectEncoding` port: `SET`/`INCR` call this before storing; today always `{ STRING, autoEncoding(value) }`, future types extend here |
+| `put` | `(key, diceObj) -> void` | `store.set(key, diceObj)` (overwrite) |
+| `get` | `(key) -> diceObj \| null` | missing → `null`; **expired** (`expireAt !== -1 && Date.now() > expireAt`) → lazy `delete` + `null`; else the `diceObj` |
 | `del` | `(key) -> boolean` | `store.delete(key)` (helper, expiry tests) |
+| `clearStore` | `() -> void` | drop everything + reset byte accounting (restart simulation) |
 
 Lazy expiry only (no background sweeper — out of scope).
 
@@ -235,5 +243,34 @@ NOTE: the 10 MB path is coded (with comments) but has NO automated test —
 filling 10 MB in unit tests is slow/flaky; verify by reasoning + the shared
 `evictFirstKeys` path it uses. `test-evict.js` covers the count path only
 (small `maxKeys`, assert oldest 10% gone, newest kept, no-evict below limit).
+
+## 13. `evalINCR(args, conn)` — `INCR key` → `:new-value`
+
+- `args.length !== 1` → `wrong number of arguments for 'incr' command`
+- `get(key)` first (lazy `get`: missing **or expired** → `null` → start at 0,
+  so `INCR new` → `:1` and stores `"1"`).
+- Live key: `assertType(obj, STRING)` → `-WRONGTYPE` on mismatch;
+  value must match `/^-?\d+$/` and be a safe integer, else
+  `value is not an integer or out of range` (value left untouched);
+  `n + 1` past safe integer → `increment or decrement would overflow`.
+- Success mutates in place: `obj.value = String(n + 1)` — **TTL untouched** —
+  then re-runs `deduceTypeEncoding` (tryObjectEncoding) and re-stamps
+  `typeEncoding`, keeping the pre-existing type nibble. Reply
+  `EncodeInteger(next)`.
+- AOF logs `INCR` verbatim (replay re-increments from the same base state,
+  so it converges — same as Redis). RDB needs nothing new (plain string).
+
+```text
+INCR hits        -> :1        (new key stored as "1", INT encoding)
+SET c 41 + INCR c -> :42      (TTL, if any, preserved)
+INCR str("hi")   -> -ERR value is not an integer or out of range
+INCR max(2^53-1)-> -ERR increment or decrement would overflow
+```
+
+Test plan (`test-incr.js`): missing → `:1` + `"1"` + INT stamp; 41 → `:42`
+→ `:43`; `-1` → `:0`; non-int / unsafe-int / overflow errors (value kept);
+0/2-arg arity; expired → `:1`; TTL preserved (`TTL` ≈ 60 after `INCR`);
+tampered type → `-WRONGTYPE`; lowercase dispatch; AOF verbatim frames +
+replay `SET 5, INCR, INCR` → `"7"`.
 
 ![alt text](image-2.png)

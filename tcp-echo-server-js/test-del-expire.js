@@ -3,7 +3,7 @@
 // Test DEL/EXPIRE/PEXPIRE + active expiry (DeleteExpiredKeys + server cron). No deps.
 const { readCmd } = require("./redis-cmd");
 const { evalDEL, evalEXPIRE, evalPEXPIRE, evalSET, evalTTL, evalAndRespond } = require("./eval");
-const { store, put, get, DeleteExpiredKeys } = require("./store");
+const { store, put, get, DeleteExpiredKeys, newObjAbs } = require("./store");
 
 let passed = 0;
 let failed = 0;
@@ -49,7 +49,7 @@ console.log("--- evalDEL ---");
     eq("DEL all missing -> :0", c.last(), ":0\r\n");
 
     // Expired key counts as absent (lazy get), not as deleted.
-    put("d:old", { value: "v", expireAt: Date.now() - 1000 });
+    put("d:old", newObjAbs("v", Date.now() - 1000));
     c = fakeConn();
     evalDEL(["d:old"], c);
     eq("DEL expired -> :0", c.last(), ":0\r\n");
@@ -114,7 +114,7 @@ console.log("--- evalEXPIRE / evalPEXPIRE ---");
     eq("EXPIRE -5 key gone", get("e:neg"), null);
 
     // EXPIRE on an already-expired key → :0.
-    put("e:old", { value: "v", expireAt: Date.now() - 1000 });
+    put("e:old", newObjAbs("v", Date.now() - 1000));
     c = fakeConn();
     evalEXPIRE(["e:old", "10"], c);
     eq("EXPIRE expired -> :0", c.last(), ":0\r\n");
@@ -132,10 +132,10 @@ console.log("--- evalEXPIRE / evalPEXPIRE ---");
 
 console.log("--- DeleteExpiredKeys (direct sweep) ---");
 (function () {
-    put("s:live1", { value: "a", expireAt: Date.now() + 60000 });
-    put("s:live2", { value: "b", expireAt: -1 });
-    put("s:dead1", { value: "x", expireAt: Date.now() - 1000 });
-    put("s:dead2", { value: "y", expireAt: Date.now() - 5000 });
+    put("s:live1", newObjAbs("a", Date.now() + 60000));
+    put("s:live2", newObjAbs("b", -1));
+    put("s:dead1", newObjAbs("x", Date.now() - 1000));
+    put("s:dead2", newObjAbs("y", Date.now() - 5000));
     const n = DeleteExpiredKeys();
     eq("sweep deletes >= 2", n >= 2, true);
     eq("dead1 gone", get("s:dead1"), null);

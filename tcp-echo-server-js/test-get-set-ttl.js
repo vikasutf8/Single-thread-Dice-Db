@@ -3,7 +3,7 @@
 // Test SET/GET/TTL: store + eval fns + evalAndRespond dispatch. No deps.
 const { readCmd } = require("./redis-cmd");
 const { evalSET, evalGET, evalTTL, evalAndRespond } = require("./eval");
-const { put, get } = require("./store");
+const { put, get, newObjAbs } = require("./store");
 
 let passed = 0;
 let failed = 0;
@@ -106,7 +106,7 @@ console.log("--- evalGET ---");
     eq("GET missing -> nil", c.last(), "$-1\r\n");
 
     // Deterministic expired key: Obj with expireAt already in the past.
-    put("s:old", { value: "stale", expireAt: Date.now() - 1000 });
+    put("s:old", newObjAbs("stale", Date.now() - 1000));
     c = fakeConn();
     evalGET(["s:old"], c);
     eq("GET expired -> nil", c.last(), "$-1\r\n");
@@ -138,7 +138,7 @@ console.log("--- evalTTL ---");
     const n = Number(evalTTL(["t:exp"], c).toString().slice(1));
     eq("TTL EX 100 in (99..100]", n <= 100 && n >= 99, true);
 
-    put("t:old", { value: "v", expireAt: Date.now() - 1000 });
+    put("t:old", newObjAbs("v", Date.now() - 1000));
     c = fakeConn();
     evalTTL(["t:old"], c);
     eq("TTL expired -> -2", c.last(), ":-2\r\n");

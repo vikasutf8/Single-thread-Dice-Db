@@ -6,10 +6,11 @@
 //               ├── switch cmd.Cmd: "PING" → evalPING, "SET" → evalSET,
 //               │                   "GET" → evalGET, "TTL" → evalTTL,
 //               │                   "DEL" → evalDEL, "EXPIRE" → evalEXPIRE,
-//               │                   "PEXPIRE" → evalPEXPIRE,
+//               │                   "PEXPIRE" → evalPEXPIRE, "INCR" → evalINCR,
 //               │                   "BGSAVE" → evalBGSAVE, "BGREWRITEAOF" → evalBGREWRITEAOF,
 //               │                   "SAVE" → evalSAVE, default → evalDefault
 //               └── write cmds log to AOF via appendCommand (aof.js);
+//                   SET/DEL/EXPIRE/PEXPIRE/INCR log the effective op.
 //                   persistence verbs run bgEvalRDB / bgEvalAOF (never block).
 //
 // Each eval*() writes its own reply (conn.write) and returns the Buffer.
@@ -17,7 +18,7 @@
 // would corrupt pipelined streams, e.g. redis-benchmark).
 
 const { EncodeSimpleString, EncodeBulkString, EncodeError, EncodeInteger } = require("./resp-encoder");
-const { newObj, put, get, del, setExpire } = require("./store");
+const { newObj, put, get, del, setExpire, OBJ_TYPE_STRING, assertType, deduceTypeEncoding, packTypeEncoding, getType } = require("./store");
 const { appendCommand, bgEvalAOF, isRewriting } = require("./aof");
 const { bgEvalRDB, dumpRDBSync, isSaving } = require("./rdb");
 
@@ -91,7 +92,9 @@ function evalSET(args, conn) {
             }
         }
         if (ok) {
-            put(key, newObj(value, expiryMs));
+            // tryObjectEncoding step: deduce (otype, oEnc) then store them.
+            const { otype, oEnc } = deduceTypeEncoding(value);
+            put(key, newObj(value, expiryMs, otype, oEnc));
             out = EncodeSimpleString("OK");
             appendCommand({ Cmd: "SET", Args: args.slice() }); // AOF: log effective write
         }
@@ -107,7 +110,12 @@ function evalGET(args, conn) {
         out = EncodeError("wrong number of arguments for 'get' command");
     } else {
         const obj = get(args[0]);
-        out = obj === null ? EncodeBulkString(null) : EncodeBulkString(String(obj.value));
+        try {
+            if (obj !== null) assertType(obj, OBJ_TYPE_STRING);
+            out = obj === null ? EncodeBulkString(null) : EncodeBulkString(String(obj.value));
+        } catch (err) {
+            out = EncodeError(err.message); // -WRONGTYPE, connection stays open
+        }
     }
     if (conn && typeof conn.write === "function") conn.write(out);
     return out;
@@ -120,13 +128,18 @@ function evalTTL(args, conn) {
         out = EncodeError("wrong number of arguments for 'ttl' command");
     } else {
         const obj = get(args[0]);
-        if (obj === null) {
-            out = EncodeInteger(-2);
-        } else if (obj.expireAt === -1) {
-            out = EncodeInteger(-1);
-        } else {
-            const secs = Math.ceil((obj.expireAt - Date.now()) / 1000);
-            out = EncodeInteger(secs <= 0 ? -2 : secs);
+        try {
+            if (obj !== null) assertType(obj, OBJ_TYPE_STRING);
+            if (obj === null) {
+                out = EncodeInteger(-2);
+            } else if (obj.expireAt === -1) {
+                out = EncodeInteger(-1);
+            } else {
+                const secs = Math.ceil((obj.expireAt - Date.now()) / 1000);
+                out = EncodeInteger(secs <= 0 ? -2 : secs);
+            }
+        } catch (err) {
+            out = EncodeError(err.message); // -WRONGTYPE, connection stays open
         }
     }
     if (conn && typeof conn.write === "function") conn.write(out);
@@ -187,6 +200,54 @@ function evalEXPIRE(args, conn) {
 // PEXPIRE key milliseconds → :1 timeout set / :0 key missing
 function evalPEXPIRE(args, conn) {
     return evalExpirelike(args, conn, "PEXPIRE", true);
+}
+
+// INCR key → value+1. Missing (or expired) key starts at 0, so INCR new = 1.
+// Non-integer value → not-an-integer error; overflow past safe integer → error.
+// TTL is preserved (only value + encoding change). AOF logs INCR verbatim:
+// replay re-increments from the same base state, so it converges.
+function evalINCR(args, conn) {
+    let out;
+    if (!Array.isArray(args) || args.length !== 1) {
+        out = EncodeError("wrong number of arguments for 'incr' command");
+    } else {
+        const key = args[0];
+        const obj = get(key); // lazy get: expired counts as missing
+        try {
+            if (obj !== null) assertType(obj, OBJ_TYPE_STRING);
+            let next;
+            if (obj === null) {
+                next = 1;
+                const { otype, oEnc } = deduceTypeEncoding(String(next));
+                put(key, newObj(String(next), -1, otype, oEnc));
+            } else {
+                const s = String(obj.value);
+                if (!/^-?\d+$/.test(s)) {
+                    out = EncodeError("value is not an integer or out of range");
+                } else {
+                    const n = Number(s);
+                    if (!Number.isSafeInteger(n)) {
+                        out = EncodeError("value is not an integer or out of range");
+                    } else if (!Number.isSafeInteger(n + 1)) {
+                        out = EncodeError("increment or decrement would overflow");
+                    } else {
+                        next = n + 1;
+                        obj.value = String(next); // TTL untouched
+                        const { oEnc } = deduceTypeEncoding(obj.value);
+                        obj.typeEncoding = packTypeEncoding(getType(obj), oEnc);
+                    }
+                }
+            }
+            if (out === undefined) {
+                out = EncodeInteger(next);
+                appendCommand({ Cmd: "INCR", Args: args.slice() }); // AOF verbatim
+            }
+        } catch (err) {
+            out = EncodeError(err.message); // -WRONGTYPE, connection stays open
+        }
+    }
+    if (conn && typeof conn.write === "function") conn.write(out);
+    return out;
 }
 
 // BGSAVE -> bgEvalRDB: snapshot now, reply immediately, write lands async.
@@ -270,6 +331,9 @@ function evalAndRespond(redisCmd, conn) {
         case "PEXPIRE":
             evalPEXPIRE(args, conn);
             break;
+        case "INCR":
+            evalINCR(args, conn);
+            break;
         case "BGSAVE":
             evalBGSAVE(args, conn);
             break;
@@ -299,6 +363,7 @@ module.exports = {
     evalDEL,
     evalEXPIRE,
     evalPEXPIRE,
+    evalINCR,
     evalBGSAVE,
     evalBGREWRITEAOF,
     evalSAVE,
