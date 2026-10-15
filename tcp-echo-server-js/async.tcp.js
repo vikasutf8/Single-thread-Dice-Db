@@ -38,7 +38,9 @@
 const net = require("node:net");
 const { readCmd } = require("./redis-cmd");
 const { evalAndRespond, respondError } = require("./eval");
-const { DeleteExpiredKeys, configureEviction } = require("./store");
+const { DeleteExpiredKeys, configureEviction, clearStore } = require("./store");
+const aof = require("./aof");
+const rdb = require("./rdb");
 
 // --- epoll constants (mirrored for teaching; used as flags in registry) ---
 const EPOLLIN = 0x001;
@@ -196,6 +198,32 @@ function RunAsyncTcpServer(host, port, opts = {}) {
         configureEviction({ maxKeys: opts.maxKeys, maxBytes: opts.maxCacheBytes });
     }
 
+    // --- Persistence (AOF + RDB), opt-in ---------------------------------
+    // RDB snapshot first, then AOF replay on top (AOF holds the newer tail).
+    // AOF append stays OFF until recovery is done so replayed cmds are not
+    // re-logged. Defaults keep every existing test file-free (no AOF/RDB
+    // unless the caller passes aofEnabled / rdbLoad).
+    const aofPath = opts.aofPath ?? aof.DEFAULT_AOF_PATH; // ./AOF/dice-master.aof
+    const rdbPath = opts.rdbPath ?? rdb.DEFAULT_RDB_PATH; // ./RDB/dump.rdb
+    const aofOn = opts.aofEnabled ?? false;
+    const NOREPLY = { write() {} }; // replay sink: no socket to answer
+    aof.configure({ path: aofPath, enabled: false });
+    rdb.configure({ path: rdbPath });
+    if (opts.rdbLoad ?? false) {
+        try {
+            const r = rdb.loadRDB(rdbPath);
+            console.log(`[persist] rdb loaded=${r.loaded} skipped=${r.skipped ?? 0}`);
+        } catch (err) {
+            console.error(`[persist] rdb load failed: ${err.message} (starting empty)`);
+            clearStore();
+        }
+    }
+    if (aofOn) {
+        aof.replayAOF(aofPath, (cmd) => evalAndRespond(cmd, NOREPLY));
+        aof.setEnabled(true);
+        console.log(`[persist] aof enabled file=${aofPath}`);
+    }
+
     parseIP(host); // Bind step validation (real bind happens in listen)
 
     // Socket(SOCK_STREAM | NONBLOCK) — one listening socket for all clients.
@@ -291,6 +319,14 @@ function RunAsyncTcpServer(host, port, opts = {}) {
             commands: totalCommands,
             batches: totalBatches,
             maxBatchDepth,
+            persist: {
+                aof: aofPath,
+                aofEnabled: aofOn,
+                aofRewriting: aof.isRewriting(),
+                rdb: rdbPath,
+                rdbSaving: rdb.isSaving(),
+                lastSave: rdb.lastSave(),
+            },
             lastCronExecution,
         }),
         close: (cb) => {

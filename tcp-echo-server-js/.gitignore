@@ -1,0 +1,9 @@
+# Persistence artifacts (created at runtime when enabled)
+AOF/
+RDB/
+*.aof
+*.rdb
+*.tmp.*
+
+# Node
+node_modules/

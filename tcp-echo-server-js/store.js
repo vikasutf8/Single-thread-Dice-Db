@@ -193,6 +193,13 @@ function cacheStats() {
     return { keys: store.size, bytes: currentBytes, evicted: totalEvicted };
 }
 
+// clearStore(): drop everything (restart simulation in tests, FLUSHALL path).
+// Resets byte accounting so the cache stays consistent afterwards.
+function clearStore() {
+    store.clear();
+    currentBytes = 0;
+}
+
 module.exports = {
     store,
     newObj,
@@ -206,6 +213,7 @@ module.exports = {
     evictIfNeeded,
     evictFirstKeys,
     cacheStats,
+    clearStore,
     NO_EXPIRE,
     EXPIRE_SAMPLE_SIZE,
     DEFAULT_MAX_KEYS,

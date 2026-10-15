@@ -140,3 +140,46 @@ Round B (burst): 200 conns x 10-PING batches, ONE write each
 - Result: PASS — 160/160 (139 regression + 21 pipeline), 3200 pipelined
   cmds over 251 conns with zero failures, `active` back to 0, `monitored` 0
   (no fd leak). `maxBatchDepth=200` proves single-hit batch execution.
+
+## Run — 2026-10-15 15:40:00 UTC
+
+- Change under test: persistence — AOF (`aof.js`, `./AOF/dice-master.aof`)
+  + RDB (`rdb.js`, `./RDB/dump.rdb`), background verbs `BGSAVE`/`BGREWRITEAOF`
+  (`bgEvalRDB`/`bgEvalAOF`) + blocking `SAVE`. Effective-op AOF logging
+  (see `persistence.md`). Opt-in: no files unless `aofEnabled`/`rdbLoad`.
+- Basic + regression suites:
+
+```text
+test-aof-rdb.js:       32 passed, 0 failed  (encode round-trip; SET logged,
+                                             bad-SET+GET not logged; replay 5
+                                             cmds incl. EXPIRE-0-as-DEL; torn
+                                             tail ignored; dumpAllAOF skips
+                                             dead + keeps TTL as PX; bg rewrite
+                                             keeps mid-rewrite tail write; RDB
+                                             round-trip + expired-skip + bad
+                                             magic throws; BGSAVE/BGREWRITEAOF
+                                             /SAVE dispatch; TCP restart
+                                             recovery via AOF and via RDB)
+test-ping.js:          20 passed, 0 failed
+test-resp-decoder.js:  35 passed, 0 failed
+test-get-set-ttl.js:   34 passed, 0 failed
+test-del-expire.js:    37 passed, 0 failed
+test-evict.js:         13 passed, 0 failed
+test-pipeline.js:      21 passed, 0 failed
+```
+
+- Load test with AOF enabled (scripted RESP-over-TCP, AOF on tmp path so the
+  repo stays clean; 200 conns x 10-cmd PING/SET batches, ONE write each):
+
+```text
+AOF-ON conns=200 depth=10 ok=200/200 bad=0, 2000 cmds in 293ms = 6826 cmds/s
+AOF-Frames-Appended=1000 (1000 SETs; 1000 PINGs read-only, correctly unlogged)
+stats {"active":0,"accepted":200,"rejected":0,"monitored":0,
+       "commands":2000,"batches":200,"maxBatchDepth":10}
+```
+
+- Baseline without AOF (previous run): 2000 cmds in 244ms = 8197 cmds/s.
+  AOF append (`appendFileSync` per write) costs ~17% throughput here.
+- Result: PASS — 192/192 (160 regression + 32 persistence), restart
+  recovery proven over real TCP for both engines, `active` back to 0,
+  `monitored` 0 (no fd leak), repo has zero stray `*.aof`/`*.rdb` files.

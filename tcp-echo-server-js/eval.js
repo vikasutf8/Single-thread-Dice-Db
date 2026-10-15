@@ -6,7 +6,11 @@
 //               ├── switch cmd.Cmd: "PING" → evalPING, "SET" → evalSET,
 //               │                   "GET" → evalGET, "TTL" → evalTTL,
 //               │                   "DEL" → evalDEL, "EXPIRE" → evalEXPIRE,
-//               │                   "PEXPIRE" → evalPEXPIRE, default → evalDefault
+//               │                   "PEXPIRE" → evalPEXPIRE,
+//               │                   "BGSAVE" → evalBGSAVE, "BGREWRITEAOF" → evalBGREWRITEAOF,
+//               │                   "SAVE" → evalSAVE, default → evalDefault
+//               └── write cmds log to AOF via appendCommand (aof.js);
+//                   persistence verbs run bgEvalRDB / bgEvalAOF (never block).
 //
 // Each eval*() writes its own reply (conn.write) and returns the Buffer.
 // evalAndRespond only dispatches — it must NOT write again (double-write
@@ -14,6 +18,8 @@
 
 const { EncodeSimpleString, EncodeBulkString, EncodeError, EncodeInteger } = require("./resp-encoder");
 const { newObj, put, get, del, setExpire } = require("./store");
+const { appendCommand, bgEvalAOF, isRewriting } = require("./aof");
+const { bgEvalRDB, dumpRDBSync, isSaving } = require("./rdb");
 
 // Any failure is written back as a RESP error so the connection stays open.
 function respondError(err, conn) {
@@ -87,6 +93,7 @@ function evalSET(args, conn) {
         if (ok) {
             put(key, newObj(value, expiryMs));
             out = EncodeSimpleString("OK");
+            appendCommand({ Cmd: "SET", Args: args.slice() }); // AOF: log effective write
         }
     }
     if (conn && typeof conn.write === "function") conn.write(out);
@@ -137,6 +144,7 @@ function evalDEL(args, conn) {
             if (get(key) !== null && del(key)) count++; // lazy get: expired counts as absent
         }
         out = EncodeInteger(count);
+        appendCommand({ Cmd: "DEL", Args: args.slice() }); // AOF: replay converges (:0 harmless)
     }
     if (conn && typeof conn.write === "function") conn.write(out);
     return out;
@@ -156,13 +164,15 @@ function evalExpirelike(args, conn, cmdName, isMillis) {
         if (!Number.isSafeInteger(n)) {
             out = EncodeError("value is not an integer or out of range");
         } else if (get(args[0]) === null) {
-            out = EncodeInteger(0);
+            out = EncodeInteger(0); // missing: no AOF record (no state change)
         } else if (n <= 0) {
             del(args[0]);
             out = EncodeInteger(1);
+            appendCommand({ Cmd: "DEL", Args: [args[0]] }); // AOF: log the effective delete
         } else {
             setExpire(args[0], isMillis ? n : n * 1000);
             out = EncodeInteger(1);
+            appendCommand({ Cmd: cmdName.toUpperCase(), Args: args.slice() }); // AOF verbatim
         }
     }
     if (conn && typeof conn.write === "function") conn.write(out);
@@ -177,6 +187,57 @@ function evalEXPIRE(args, conn) {
 // PEXPIRE key milliseconds → :1 timeout set / :0 key missing
 function evalPEXPIRE(args, conn) {
     return evalExpirelike(args, conn, "PEXPIRE", true);
+}
+
+// BGSAVE -> bgEvalRDB: snapshot now, reply immediately, write lands async.
+function evalBGSAVE(args, conn) {
+    let out;
+    if (Array.isArray(args) && args.length > 0) {
+        out = EncodeError("wrong number of arguments for 'bgsave' command");
+    } else if (isSaving()) {
+        out = EncodeError("rdb save already in progress");
+    } else {
+        bgEvalRDB().then((r) => {
+            if (!r.ok) console.error(`[bgsave] failed: ${r.reason}`);
+        });
+        out = EncodeSimpleString("Background saving started");
+    }
+    if (conn && typeof conn.write === "function") conn.write(out);
+    return out;
+}
+
+// BGREWRITEAOF -> bgEvalAOF: compact the log, reply immediately.
+function evalBGREWRITEAOF(args, conn) {
+    let out;
+    if (Array.isArray(args) && args.length > 0) {
+        out = EncodeError("wrong number of arguments for 'bgrewriteaof' command");
+    } else if (isRewriting()) {
+        out = EncodeError("aof rewrite already in progress");
+    } else {
+        bgEvalAOF().then((r) => {
+            if (!r.ok) console.error(`[bgrewriteaof] failed: ${r.reason}`);
+        });
+        out = EncodeSimpleString("Background append only file rewriting started");
+    }
+    if (conn && typeof conn.write === "function") conn.write(out);
+    return out;
+}
+
+// SAVE -> blocking RDB snapshot (terminal use; stalls the loop briefly).
+function evalSAVE(args, conn) {
+    let out;
+    if (Array.isArray(args) && args.length > 0) {
+        out = EncodeError("wrong number of arguments for 'save' command");
+    } else {
+        try {
+            dumpRDBSync();
+            out = EncodeSimpleString("OK");
+        } catch (err) {
+            out = EncodeError(err.message);
+        }
+    }
+    if (conn && typeof conn.write === "function") conn.write(out);
+    return out;
 }
 
 // Entry: dispatch on upper-cased Cmd. Never throws.
@@ -209,6 +270,15 @@ function evalAndRespond(redisCmd, conn) {
         case "PEXPIRE":
             evalPEXPIRE(args, conn);
             break;
+        case "BGSAVE":
+            evalBGSAVE(args, conn);
+            break;
+        case "BGREWRITEAOF":
+            evalBGREWRITEAOF(args, conn);
+            break;
+        case "SAVE":
+            evalSAVE(args, conn);
+            break;
         default:
             evalDefault(redisCmd, conn);
             break;
@@ -229,6 +299,9 @@ module.exports = {
     evalDEL,
     evalEXPIRE,
     evalPEXPIRE,
+    evalBGSAVE,
+    evalBGREWRITEAOF,
+    evalSAVE,
     evalDefault,
     evalAndRespond,
     respondError,
