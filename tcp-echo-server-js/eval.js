@@ -18,7 +18,7 @@
 // would corrupt pipelined streams, e.g. redis-benchmark).
 
 const { EncodeSimpleString, EncodeBulkString, EncodeError, EncodeInteger } = require("./resp-encoder");
-const { newObj, put, get, del, setExpire, OBJ_TYPE_STRING, assertType, deduceTypeEncoding, packTypeEncoding, getType } = require("./store");
+const { newObj, put, get, del, setExpire, OBJ_TYPE_STRING, assertType, deduceTypeEncoding, packTypeEncoding, getType, getInfo } = require("./store");
 const { appendCommand, bgEvalAOF, isRewriting } = require("./aof");
 const { bgEvalRDB, dumpRDBSync, isSaving } = require("./rdb");
 
@@ -301,6 +301,27 @@ function evalSAVE(args, conn) {
     return out;
 }
 
+// INFO -> server statistics
+function evalINFO(args, conn) {
+    let out;
+    if (Array.isArray(args) && args.length > 0) {
+        out = EncodeError("wrong number of arguments for 'info' command");
+    } else {
+        const info = getInfo();
+        const lines = [];
+        for (const [section, data] of Object.entries(info)) {
+            lines.push(`# ${section}`);
+            for (const [key, value] of Object.entries(data)) {
+                lines.push(`${key}:${value}`);
+            }
+            lines.push("");
+        }
+        out = EncodeBulkString(lines.join("\r\n"));
+    }
+    if (conn && typeof conn.write === "function") conn.write(out);
+    return out;
+}
+
 // Entry: dispatch on upper-cased Cmd. Never throws.
 // Each eval*() already did the single conn.write — no write here.
 function evalAndRespond(redisCmd, conn) {
@@ -343,6 +364,9 @@ function evalAndRespond(redisCmd, conn) {
         case "SAVE":
             evalSAVE(args, conn);
             break;
+        case "INFO":
+            evalINFO(args, conn);
+            break;
         default:
             evalDefault(redisCmd, conn);
             break;
@@ -367,6 +391,7 @@ module.exports = {
     evalBGSAVE,
     evalBGREWRITEAOF,
     evalSAVE,
+    evalINFO,
     evalDefault,
     evalAndRespond,
     respondError,
