@@ -36,6 +36,7 @@
 //     - backpressure + oversize-buffer guards (mandatory at 10k scale)
 
 const net = require("node:net");
+const fs = require("node:fs");
 const { readCmd } = require("./redis-cmd");
 const { evalAndRespond, respondError } = require("./eval");
 const { DeleteExpiredKeys, configureEviction, clearStore } = require("./store");
@@ -229,6 +230,11 @@ function RunAsyncTcpServer(host, port, opts = {}) {
     // Socket(SOCK_STREAM | NONBLOCK) — one listening socket for all clients.
     const server = net.createServer({ keepAlive: true });
 
+    // Track shutdown state
+    let shuttingDown = false;
+    let shutdownPromise = null;
+    let shutdownResolve = null;
+
     // EpollCtl(ADD, serverFd, EPOLLIN): libuv registers the listen fd with
     // epoll/kqueue internally. Our visible part: cap concurrent accepts.
     server.maxConnections = maxClients;
@@ -237,6 +243,13 @@ function RunAsyncTcpServer(host, port, opts = {}) {
     // EpollWait dispatch: this callback fires once per ready accept (== one
     // EPOLLIN hit on serverFd). Accept() + SetNonBlock + EpollCtl(ADD, cfd).
     server.on("connection", (conn) => {
+        // If shutting down, reject new connections immediately
+        if (shuttingDown) {
+            try { conn.write("-ERR server shutting down\r\n"); } catch { /* ignore */ }
+            conn.destroy();
+            return;
+        }
+
         // Admission control — beyond maxClients, reject immediately so one
         // flood cannot OOM the other 19,999 connections.
         if (concurrentClients >= maxClients) {
@@ -309,6 +322,86 @@ function RunAsyncTcpServer(host, port, opts = {}) {
     }, cronFrequency);
     cronTimer.unref();
 
+    // Graceful shutdown function
+    async function gracefulShutdown({ saveRDB = false, flushAOF = true, timeoutMs = 10000 } = {}) {
+        if (shutdownPromise) return shutdownPromise;
+
+        shuttingDown = true;
+        console.log("[shutdown] initiating graceful shutdown...");
+
+        shutdownPromise = new Promise(async (resolve) => {
+            shutdownResolve = resolve;
+
+            // 1. Stop accepting new connections
+            console.log("[shutdown] stopping new connections...");
+            server.close();
+
+            // 2. Wait for existing connections to finish or timeout
+            if (fdRegistry.size > 0) {
+                console.log(`[shutdown] waiting for ${fdRegistry.size} active connections (timeout ${timeoutMs}ms)...`);
+                
+                const waitStart = Date.now();
+                while (fdRegistry.size > 0 && Date.now() - waitStart < timeoutMs) {
+                    // Give clients time to finish their current requests
+                    await new Promise(r => setTimeout(r, 100));
+                }
+
+                // Force close remaining connections
+                if (fdRegistry.size > 0) {
+                    console.log(`[shutdown] force closing ${fdRegistry.size} remaining connections...`);
+                    for (const fdComm of fdRegistry.values()) {
+                        try { 
+                            fdComm.socket.write("-ERR server shutting down\r\n"); 
+                            fdComm.socket.end();
+                        } catch { /* ignore */ }
+                        closeClient(fdComm, "shutdown");
+                    }
+                }
+            }
+
+            // 3. Flush AOF if enabled
+            if (flushAOF && aofOn) {
+                console.log("[shutdown] flushing AOF...");
+                try {
+                    if (fs.existsSync(aofPath)) {
+                        const fd = fs.openSync(aofPath, "r");
+                        fs.fsyncSync(fd); // force pending appends to disk
+                        fs.closeSync(fd);
+                        console.log("[shutdown] AOF flushed");
+                    } else {
+                        console.log("[shutdown] AOF file absent (nothing appended)");
+                    }
+                } catch (err) {
+                    console.error("[shutdown] AOF flush failed:", err.message);
+                }
+            }
+
+            // 4. Save RDB if requested
+            if (saveRDB) {
+                console.log("[shutdown] saving RDB snapshot...");
+                try {
+                    const result = await rdb.bgEvalRDB(rdbPath);
+                    if (result.ok) {
+                        console.log(`[shutdown] RDB saved: keys=${result.keys}`);
+                    } else {
+                        console.error("[shutdown] RDB save failed:", result.reason);
+                    }
+                } catch (err) {
+                    console.error("[shutdown] RDB save error:", err.message);
+                }
+            }
+
+            // 5. Clean up timers
+            clearInterval(cronTimer);
+            clearInterval(statTimer);
+
+            console.log("[shutdown] graceful shutdown complete");
+            resolve();
+        });
+
+        return shutdownPromise;
+    }
+
     return {
         server,
         stats: () => ({
@@ -334,11 +427,38 @@ function RunAsyncTcpServer(host, port, opts = {}) {
             clearInterval(statTimer);
             server.close(cb);
         },
+        gracefulShutdown,
     };
+}
+
+// Setup signal handlers for graceful shutdown (optional, call from main.js)
+// Returns the server handle so you can await gracefulShutdown() on signal
+function setupGracefulShutdown(serverHandle, opts = {}) {
+    const { saveRDB = false, flushAOF = true, timeoutMs = 10000 } = opts;
+    
+    const handleSignal = async (signal) => {
+        console.log(`[shutdown] received ${signal}, starting graceful shutdown...`);
+        await serverHandle.gracefulShutdown({ saveRDB, flushAOF, timeoutMs });
+        console.log("[shutdown] exiting");
+        process.exit(0);
+    };
+
+    process.on("SIGINT", () => handleSignal("SIGINT"));
+    process.on("SIGTERM", () => handleSignal("SIGTERM"));
+    
+    // Handle uncaught exceptions gracefully
+    process.on("uncaughtException", async (err) => {
+        console.error("[shutdown] uncaught exception:", err);
+        await serverHandle.gracefulShutdown({ saveRDB, flushAOF, timeoutMs });
+        process.exit(1);
+    });
+    
+    return serverHandle;
 }
 
 module.exports = {
     RunAsyncTcpServer,
+    setupGracefulShutdown,
     EPOLLIN,
     EPOLL_CTL_ADD,
     EPOLL_CTL_DEL,

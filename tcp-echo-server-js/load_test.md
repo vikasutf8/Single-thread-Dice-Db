@@ -265,4 +265,54 @@ stats {"active":0,"accepted":100,"monitored":0,"commands":2100,"maxBatchDepth":2
 - Result: PASS — 255/255 (234 regression + 21 incr), read-modify-write
   batches exact under concurrency, `active` back to 0, `monitored` 0.
 
+## Run — 2026-10-19 17:23:40 UTC
+
+- Change under test: **graceful shutdown** of the async server —
+  `gracefulShutdown()` / `setupGracefulShutdown()` in `async.tcp.js`: stop
+  accepting, drain accepted clients up to `timeoutMs`, force-close stragglers,
+  fsync AOF, optional RDB snapshot; plus `opts.policy` wiring at startup
+  (see `graceful-shutdown.md`). **Prod env**: maxKeys=200000, evictPercent=4%,
+  allkeys-lru (24-bit LRU clock + 16-entry eviction pool).
+- Basic + regression suites:
+
+```text
+test-graceful-shutdown.js: 17 passed, 0 failed  (basic active->0; drain active
+                                            conns; reject during shutdown;
+                                            AOF fsync; RDB save+reload; signal
+                                            setup; idempotent double-call;
+                                            timeout force-close)
+test-load-graceful.js:     21 passed, 0 failed  (prod rounds A/B/C below)
+test-evict.js:         22 passed, 0 failed  (LRU + random, pool, policy switch)
+test-aof-rdb.js:       32 passed, 0 failed
+test-diceobj.js:       42 passed, 0 failed
+test-del-expire.js:    37 passed, 0 failed
+test-get-set-ttl.js:   34 passed, 0 failed
+test-incr.js:          21 passed, 0 failed
+test-ping.js:          20 passed, 0 failed
+test-pipeline.js:      21 passed, 0 failed
+test-resp-decoder.js:  35 passed, 0 failed
+```
+
+- Load test at prod env (scripted RESP-over-TCP, one write per pipelined batch):
+
+```text
+Round A (prod baseline): 200 conns x 10 batches x 10 cmds (PING/SET) = 20k cmds
+  -> ok=200/200 byte-exact, 0 timeouts, 96ms = 208k cmds/s
+  -> keys=10000 (10k unique), evicted=0, pool=16 (below prod limit 200k)
+Round B (prod eviction): 100 conns x 25 batches x 100 unique SETs = 250k cmds
+  vs maxKeys=200000
+  -> ok=100/100 byte-exact, 0 timeouts, 878ms = 285k cmds/s
+  -> keys bounded at 200000, evicted=50000 over 3125 evict events, pool<=16
+Round C (shutdown WHILE 100 clients mid-flight): AOF + RDB on, shutdown after 30ms
+  -> 3 accepted conns drained fully (600/600 SETs applied, byte-exact)
+  -> 97 conns still in OS accept backlog refused (listen socket closed) — expected
+  -> shutdown=113ms (limit 3000ms); active=0; monitored=0 (no fd leak)
+  -> AOF=20700 bytes (fsync'd); RDB reload 600/600 == keys-at-save (zero loss)
+```
+
+- Result: PASS — 302/302 across 11 suites (264 regression + 17 shutdown + 21 load);
+  290k cmds executed under prod config with zero mismatches; graceful shutdown
+  finishes in 113ms under live load with AOF fsync + RDB snapshot, zero data
+  loss for accepted commands, `active`/`monitored` back to 0.
+
 

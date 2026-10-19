@@ -44,3 +44,6 @@ Key Technical Highlights
 - Protocol: Full RESP2 decoder/encoder, inline fallback for nc, pipelined batch drain
 - Observability: INFO command with 5 sections (server, stats, memory, keyspace, eviction)
 - Correctness: 260/260 tests pass, zero fd leaks (active→0, monitored→0), restart recovery verified over TCP
+
+
+![alt text](image-5.png)
