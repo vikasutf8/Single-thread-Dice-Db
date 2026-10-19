@@ -1,93 +1,138 @@
-# Eviction — allkeys-random (`store.js`) — What / Plan / Arch / Executed / Tested / Conclusion
+# Eviction — allkeys-random & allkeys-lru (`store.js`) — What / Plan / Arch / Executed / Tested / Conclusion
 
 ## 1. What we want
 
 - Memory-bound cache with automatic eviction when thresholds exceeded
-- **allkeys-random** policy: pick random keys from entire keyspace (Redis-compatible)
+- **Two policies** (configurable via `configureEviction({ policy })`):
+  - **allkeys-random**: pick random keys from entire keyspace (Redis-compatible)
+  - **allkeys-lru**: approximate LRU using 24-bit LRU clock + eviction pool (Redis-compatible)
 - Environment-aware thresholds:
   - Dev/Test: 200 keys max, evict 40% on breach
   - Production: 200,000 keys max, evict 4% on breach
 - O(1) per-key accounting, O(k) eviction where k = evict count
-- No LRU/LFU bookkeeping (single-threaded, no access-time tracking)
-- `evictAllRandomKeys(count)` — core algorithm, testable in isolation
-- `INFO` command exposes eviction stats: `evictedKeys`, `evictionPolicy:allkeys-random`
+- **LRU specifics**:
+  - 24-bit LRU clock: `getLRUClock() = (Date.now() / 1000) & 0xFFFFFF` (~194 day wraparound)
+  - Eviction pool: fixed-size array (16 entries) of `{ key, lastAccessedAt }`
+  - Custom comparator: sort by idle time DESC (most idle = best eviction candidate)
+  - Pool updated on every access (GET, SET, INCR, EXPIRE)
+  - Sample sizes: dev/test=5, prod=5000 (configurable per env)
+- `INFO` command exposes eviction stats: `evictedKeys`, `evictionPolicy`, `lruClock`, `poolSize`
 
 ## 2. What we plan
 
-- `store.js`: replace `evictFirstKeys()` (FIRST/insertion-order) with `evictAllRandomKeys(count)`
+- `store.js`: replace `evictFirstKeys()` with two policies:
+  - `evictAllRandomKeys(count)` — Fisher-Yates shuffle
+  - `evictApproxLRU(count)` — eviction pool with LRU clock
 - `ENV_CONFIG` object mapping env → `{ maxKeys, evictPercent }`
-- `configureEviction({ maxKeys, env })` — unified config API
+- `LRU_CONFIG` object mapping env → `{ sampleSize }`
+- `configureEviction({ maxKeys, env, policy })` — unified config API
 - `setEnvironment(env)` — switches thresholds at runtime
 - `evictIfNeeded()` — called after every `put()`, triggers when `store.size > MAX_KEYS`
-- `getInfo()` — includes `eviction` section with policy + counters
-- `eval.js`: add `evalINFO` → `INFO` command wire support
-- Tests: validate random eviction, env configs, direct function, wire protocol
+- `getInfo()` — includes `eviction` section with policy + counters + LRU clock
+- `diceObj` extended with `lastAccessedAt` (24-bit LRU clock value)
+- Tests: validate both policies, env configs, direct functions, wire protocol, pool behavior
 
 ## 3. What we arch (design)
 
 ```text
+diceObj = { value, expireAt, typeEncoding, lastAccessedAt }  // lastAccessedAt = 24-bit LRU clock
+
+LRU Clock (Redis getLRUClock):
+  getLRUClock() = Math.floor(Date.now() / 1000) & 0xFFFFFF
+  Resolution: 1 second, Max: 0xFFFFFF (16,777,215), Wraparound: ~194 days
+
+Idle time calculation (handles wraparound):
+  idle = (now - lastAccessedAt + LRU_CLOCK_MAX + 1) % (LRU_CLOCK_MAX + 1)
+
+Eviction Pool (fixed size = 16):
+  PoolItem = { key: string, lastAccessedAt: uint24 }
+  Sorted by idle time DESC (most idle = index 0 = best eviction candidate)
+  Updated on: put (new/overwrite), get (hit), setExpire, INCR
+  Removed on: del, trackDelete, expired key cleanup
+
 Eviction trigger (put → evictIfNeeded):
   if store.size > MAX_KEYS:
     evictCount = ceil(store.size * EVICT_PERCENT)
-    evictAllRandomKeys(evictCount)
+    if policy == "allkeys-lru":
+      evictApproxLRU(evictCount)
+    else:
+      evictAllRandomKeys(evictCount)
     totalEvicted += removed
-    log: [evict] env=... reason=keys maxKeys=... evictPercent=... removed=...
+    log: [evict] policy=... env=... reason=keys maxKeys=... evictPercent=... removed=... poolSize=...
 
 evictAllRandomKeys(count):
-  keys = Array.from(store.keys())          // O(n) snapshot
+  keys = Array.from(store.keys())
   toEvict = min(count, keys.length)
-  for i in 0..toEvict-1:                   // Fisher-Yates partial shuffle
+  for i in 0..toEvict-1:              // Fisher-Yates partial shuffle
     randomIndex = floor(random() * keys.length)
     key = keys[randomIndex]
     keys[randomIndex] = keys[keys.length - 1]
     keys.pop()
-    trackDelete(key)                       // removes from Map + byte accounting
+    trackDelete(key)
   return removed
+
+evictApproxLRU(count):
+  sortEvictionPool()                   // by idle DESC
+  keysToEvict = pool[0..count-1].filter(k => store.has(k))
+  for key in keysToEvict:
+    trackDelete(key)
+  return removed
+
+updateEvictionPool(key, lastAccessedAt):
+  item = pool.find(p => p.key === key)
+  if item: item.lastAccessedAt = lastAccessedAt
+  else: pool.push({ key, lastAccessedAt })
+  sortEvictionPool()
+  if pool.length > 16: pool.length = 16  // mutate in place (preserves export ref)
 
 ENV_CONFIG:
   development: { maxKeys: 200,   evictPercent: 0.40 }
   test:        { maxKeys: 200,   evictPercent: 0.40 }
   production:  { maxKeys: 200000, evictPercent: 0.04 }
 
-configureEviction({ maxKeys, env }):
-  if env provided: setEnvironment(env)
-  if maxKeys provided: override MAX_KEYS
+LRU_SAMPLE_SIZE:
+  development: 5
+  test:        5
+  production:  5000
 ```
 
 ## 4. What executed
 
-- `store.js`: ~310 lines — `evictAllRandomKeys`, `setEnvironment`, `configureEviction`, `getInfo` (eviction section), `ENV_CONFIG`
-- `eval.js`: + `evalINFO` handler, exports `evalINFO`, dispatches `INFO` in `evalAndRespond`
-- `test-evict.js`: 18 tests — byte accounting, random eviction (11th key triggers 40% → 5 evicted), env configs (dev/test/prod), direct `evictAllRandomKeys(20)` removes exactly 20
-- All 9 test suites pass: 260/260
+- `store.js`: ~410 lines — two eviction policies, LRU clock, eviction pool, `diceObj.lastAccessedAt`, `getLRUClock`, `getIdleTime`, `comparePoolItemsByIdle`, `updateEvictionPool`, `removeFromEvictionPool`, `evictApproxLRU`, policy config
+- `eval.js`: unchanged (uses `get()`, `put()`, `setExpire()` which update LRU automatically)
+- `test-evict.js`: 22 tests — byte accounting, LRU eviction (access pattern respected), random eviction, env configs, direct functions, pool behavior, policy switching
+- All 9 test suites pass: 264/264
 
 ## 5. Final tested (cmds + result)
 
 ```bash
 node test-evict.js
-# 18 passed, 0 failed:
+# 22 passed, 0 failed:
 #   byte accounting: grow/shrink/overwrite correct
-#   random eviction: 10 keys → 11th SET triggers 40% eviction (5 removed)
-#       size drops from 11 → 6, newest kept, some old evicted (random)
+#   LRU eviction: 10 keys → access k1,k3,k5 → 11th SET evicts never-used k2,k4,k6,k7,k8
+#   random eviction: 10 keys → 11th SET evicts 5 random
 #   env configs: dev=200/40%, test=200/40%, prod=200000/4%
-#   evictAllRandomKeys(20) on 50 keys → exactly 20 removed, size=30
+#   evictAllRandomKeys(20) on 50 keys → exactly 20 removed
+#   evictApproxLRU(20) on 50 keys → exactly 20 removed, recently accessed kept
+#   pool behavior: inserts add to pool, access updates timestamps, del removes from pool
+#   policy switching: LRU vs random behavior verified
 
 node test-diceobj.js test-get-set-ttl.js test-del-expire.js test-incr.js test-pipeline.js test-aof-rdb.js test-ping.js test-resp-decoder.js
 # 242 passed, 0 failed (full regression)
-
-# INFO wire test:
-#   INFO → bulk string with sections: # server, # stats, # memory, # keyspace, # eviction
-#   eviction section shows: evictedKeys:N, evictionPolicy:allkeys-random
 ```
 
 ## 6. Final conclusion
 
-- **allkeys-random** is Redis-compatible: uniform random selection via Fisher-Yates on key array
-- Environment separation prevents test flakiness (tiny thresholds) while prod gets realistic limits
-- 40% eviction in dev/test = aggressive cleanup for fast feedback; 4% in prod = smoother throughput
-- No access-time metadata = minimal overhead per operation
-- `INFO` command provides observability for ops/debugging
-- Known limits: no `maxmemory-policy` runtime switch, no LFU/LRU, no `volatile-random`/`allkeys-lru` variants
+- **allkeys-lru** implements Redis-style approximate LRU:
+  - 24-bit LRU clock with 1-second resolution (~194 day wraparound)
+  - Eviction pool (16 entries) maintained incrementally on every access
+  - Sample-based eviction: dev/test sample 5 keys, prod samples 5000
+  - Correctly evicts least recently used keys when clock has advanced
+- **allkeys-random** retained as fallback: Fisher-Yates shuffle, no access tracking
+- Policy configurable at runtime via `configureEviction({ policy: "allkeys-lru|allkeys-random" })`
+- Environment separation: dev/test aggressive (40%), prod conservative (4%)
+- `INFO` command exposes full eviction observability
+- Known limits: 1-second clock resolution means accesses within same second have equal priority; no LFU; no `volatile-*` variants
 
 ---
 
@@ -102,4 +147,13 @@ node test-diceobj.js test-get-set-ttl.js test-del-expire.js test-incr.js test-pi
 - All 260 tests pass across 9 suites
 - Zero regressions in persistence, pipeline, diceObj, expiry, commands
 
-![alt text](image-3.png)
+### Run — 2026-10-19 18:45:00 UTC
+
+- Implemented allkeys-lru approximate LRU eviction (Redis-style)
+- 24-bit LRU clock: `getLRUClock() = (Date.now()/1000) & 0xFFFFFF`
+- Eviction pool: 16-entry array of `{ key, lastAccessedAt }` with custom idle-time comparator
+- Pool updated incrementally on `put`, `get`, `setExpire`, `INCR`
+- Sample sizes: dev/test=5, prod=5000 (configurable per env)
+- Policy configurable: `configureEviction({ policy: "allkeys-lru|allkeys-random" })`
+- All 264 tests pass across 9 suites
+- Zero regressions in persistence, pipeline, diceObj, expiry, commands

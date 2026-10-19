@@ -193,9 +193,9 @@ function RunAsyncTcpServer(host, port, opts = {}) {
     const cronFrequency = opts.cronFrequency ?? DEFAULT_CRON_FREQUENCY_MS;
 
     // Eviction thresholds: defaults 20k keys / 10 MB; terminal demos and
-    // tests shrink them, e.g. { maxKeys: 10 }.
-    if (opts.maxKeys !== undefined || opts.maxCacheBytes !== undefined) {
-        configureEviction({ maxKeys: opts.maxKeys, maxBytes: opts.maxCacheBytes });
+    // tests shrink them, e.g. { maxKeys: 10 }. policy: "allkeys-lru" | "allkeys-random".
+    if (opts.maxKeys !== undefined || opts.maxCacheBytes !== undefined || opts.policy !== undefined) {
+        configureEviction({ maxKeys: opts.maxKeys, maxBytes: opts.maxCacheBytes, policy: opts.policy });
     }
 
     // --- Persistence (AOF + RDB), opt-in ---------------------------------

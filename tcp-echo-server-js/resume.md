@@ -22,3 +22,25 @@ Built crash-safe persistence layer with AOF (append-only file) + RDB (binary sna
 - **Persistence**: AOF rewrite-buffer semantics, RDB2 format with RDB1 compat, atomic rename
 - **Observability**: INFO command with server, stats, memory, keyspace, eviction sections
 - **Testing**: 260+ tests across 9 suites (protocol, commands, eviction, pipeline, persistence, restart recovery, diceObj, INCR, INFO)
+
+![alt text](image-4.png)
+Documentation (11 .md files — all append-only format)
+ 1. load_test.md — 7 dated benchmark runs (5505→8974 cmds/s)
+ 2. persistence.md — AOF+RDB design, executed, tested, conclusion
+ 3. eviction.md — allkeys-random Fisher-Yates, env thresholds, INFO exposure
+ 4. commands.md — 11 commands table, wire semantics, AOF effective-op logging
+ 5. pipeline.md — cork/uncork, pipeline≠transaction, maxBatchDepth stats
+ 6. diceobj.md — redisObject port, 4+4 bit layout, RDB2, WRONGTYPE seam
+ 7. async_tcp.md — epoll mapping, 20k guards, libuv reality
+ 8. resp-decoder-notes.md — Go→Node port, 35 tests
+ 9. ping-command-notes.md — First command implementation log
+10. redis_cmd_impl.md — Spec-first contract for SET/GET/TTL/DEL/EXPIRE/INCR
+11. tcp-echo-server-notes.md — Original Go/Node echo server
+Key Technical Highlights
+- Concurrency: 20k clients via libuv epoll/kqueue, per-fd 1MiB buffer guard, backpressure pause/resume
+- Pipeline: cork/uncork = single TCP flush per EPOLLIN hit; maxBatchDepth=200 proven
+- Eviction: allkeys-random (Fisher-Yates on key array), env-aware (dev/test 200/40%, prod 200K/4%)
+- Persistence: AOF (per-write sync append) + RDB (binary snapshot), both crash-safe via tmp+rename, background verbs non-blocking
+- Protocol: Full RESP2 decoder/encoder, inline fallback for nc, pipelined batch drain
+- Observability: INFO command with 5 sections (server, stats, memory, keyspace, eviction)
+- Correctness: 260/260 tests pass, zero fd leaks (active→0, monitored→0), restart recovery verified over TCP

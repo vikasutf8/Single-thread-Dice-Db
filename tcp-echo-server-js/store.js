@@ -72,6 +72,31 @@ const ENTRY_OVERHEAD = 64;
 let currentBytes = 0;
 let totalEvicted = 0;
 
+const LRU_BITS = 24;
+const LRU_CLOCK_MAX = (1 << LRU_BITS) - 1;
+const LRU_CLOCK_RESOLUTION = 1000;
+const EVICTION_POOL_SIZE = 16;
+const LRU_SAMPLE_SIZE = {
+    [ENV_DEV]: 5,
+    [ENV_TEST]: 5,
+    [ENV_PROD]: 5000,
+};
+
+let currentPolicy = "allkeys-lru";
+let evictionPool = [];
+
+function getLRUClock() {
+    return Math.floor(Date.now() / LRU_CLOCK_RESOLUTION) & LRU_CLOCK_MAX;
+}
+
+function getIdleTime(obj) {
+    if (!obj || obj.lastAccessedAt === undefined) return 0;
+    const now = getLRUClock();
+    let diff = now - obj.lastAccessedAt;
+    if (diff < 0) diff += LRU_CLOCK_MAX + 1;
+    return diff * LRU_CLOCK_RESOLUTION;
+}
+
 function setEnvironment(env) {
     const normalized = String(env).toLowerCase();
     if (normalized === "prod" || normalized === "production") {
@@ -85,9 +110,15 @@ function setEnvironment(env) {
     EVICT_PERCENT = ENV_CONFIG[currentEnv].evictPercent;
 }
 
-function configureEviction({ maxKeys, maxBytes, env } = {}) {
+function configureEviction({ maxKeys, maxBytes, env, policy } = {}) {
     if (env !== undefined) setEnvironment(env);
     if (maxKeys !== undefined) MAX_KEYS = Number(maxKeys);
+    if (policy !== undefined) {
+        if (policy !== "allkeys-random" && policy !== "allkeys-lru") {
+            throw new Error(`Unknown eviction policy: ${policy}`);
+        }
+        currentPolicy = policy;
+    }
 }
 
 function entrySize(key, obj) {
@@ -98,35 +129,72 @@ function entrySize(key, obj) {
     );
 }
 
+function comparePoolItemsByIdle(a, b) {
+    const idleA = a.lastAccessedAt === undefined ? 0 : (getLRUClock() - a.lastAccessedAt + LRU_CLOCK_MAX + 1) % (LRU_CLOCK_MAX + 1);
+    const idleB = b.lastAccessedAt === undefined ? 0 : (getLRUClock() - b.lastAccessedAt + LRU_CLOCK_MAX + 1) % (LRU_CLOCK_MAX + 1);
+    return idleB - idleA;
+}
+
+function sortEvictionPool() {
+    evictionPool.sort(comparePoolItemsByIdle);
+}
+
+function updateEvictionPool(key, lastAccessedAt) {
+    let item = evictionPool.find(p => p.key === key);
+    if (item) {
+        item.lastAccessedAt = lastAccessedAt;
+    } else {
+        evictionPool.push({ key, lastAccessedAt });
+    }
+    sortEvictionPool();
+    if (evictionPool.length > EVICTION_POOL_SIZE) {
+        evictionPool.length = EVICTION_POOL_SIZE;
+    }
+}
+
+function removeFromEvictionPool(key) {
+    const idx = evictionPool.findIndex(p => p.key === key);
+    if (idx !== -1) {
+        evictionPool.splice(idx, 1);
+    }
+}
+
 function trackDelete(key) {
     const obj = store.get(key);
     if (obj === undefined) return false;
     currentBytes -= entrySize(key, obj);
     store.delete(key);
+    removeFromEvictionPool(key);
     return true;
 }
 
 function newObj(value, durationMs, otype = OBJ_TYPE_STRING, oEnc) {
     const ms = Number(durationMs);
+    const now = getLRUClock();
     return {
         value,
         expireAt: Number.isFinite(ms) && ms > 0 ? Date.now() + ms : NO_EXPIRE,
         typeEncoding: packTypeEncoding(otype, oEnc === undefined ? autoEncoding(value) : oEnc),
+        lastAccessedAt: now,
     };
 }
 
 function newObjAbs(value, expireAt, otype = OBJ_TYPE_STRING, oEnc) {
+    const now = getLRUClock();
     return {
         value,
         expireAt: Number(expireAt),
         typeEncoding: packTypeEncoding(otype, oEnc === undefined ? autoEncoding(value) : oEnc),
+        lastAccessedAt: now,
     };
 }
 
 function put(key, obj) {
-    if (store.has(key)) currentBytes -= entrySize(key, store.get(key));
+    const isNew = !store.has(key);
+    if (!isNew) currentBytes -= entrySize(key, store.get(key));
     store.set(key, obj);
     currentBytes += entrySize(key, obj);
+    updateEvictionPool(key, obj.lastAccessedAt);
     evictIfNeeded();
 }
 
@@ -137,6 +205,9 @@ function get(key) {
         trackDelete(key);
         return null;
     }
+    const now = getLRUClock();
+    obj.lastAccessedAt = now;
+    updateEvictionPool(key, now);
     return obj;
 }
 
@@ -148,6 +219,9 @@ function setExpire(key, durationMs) {
     const obj = get(key);
     if (obj === null) return false;
     obj.expireAt = Date.now() + Number(durationMs);
+    const now = getLRUClock();
+    obj.lastAccessedAt = now;
+    updateEvictionPool(key, now);
     return true;
 }
 
@@ -201,13 +275,31 @@ function evictAllRandomKeys(count) {
     return removed;
 }
 
+function evictApproxLRU(count) {
+    if (count <= 0 || store.size === 0) return 0;
+    sortEvictionPool();
+    const keysToEvict = [];
+    for (const item of evictionPool) {
+        if (keysToEvict.length >= count) break;
+        if (store.has(item.key)) {
+            keysToEvict.push(item.key);
+        }
+    }
+    let removed = 0;
+    for (const key of keysToEvict) {
+        if (trackDelete(key)) removed++;
+    }
+    return removed;
+}
+
 function evictIfNeeded() {
     if (store.size <= MAX_KEYS) return 0;
     const evictCount = Math.ceil(store.size * EVICT_PERCENT);
-    const removed = evictAllRandomKeys(evictCount);
+    const evictFn = currentPolicy === "allkeys-lru" ? evictApproxLRU : evictAllRandomKeys;
+    const removed = evictFn(evictCount);
     totalEvicted += removed;
     console.log(
-        `[evict] env=${currentEnv} reason=keys maxKeys=${MAX_KEYS} evictPercent=${EVICT_PERCENT} removed=${removed} size=${store.size} bytes=${currentBytes}`
+        `[evict] policy=${currentPolicy} env=${currentEnv} reason=keys maxKeys=${MAX_KEYS} evictPercent=${EVICT_PERCENT} removed=${removed} size=${store.size} bytes=${currentBytes} poolSize=${evictionPool.length}`
     );
     return removed;
 }
@@ -219,6 +311,7 @@ function cacheStats() {
 function clearStore() {
     store.clear();
     currentBytes = 0;
+    evictionPool.length = 0;
 }
 
 function getInfo() {
@@ -261,7 +354,9 @@ function getInfo() {
         },
         eviction: {
             evictedKeys: totalEvicted,
-            evictionPolicy: "allkeys-random",
+            evictionPolicy: currentPolicy,
+            lruClock: getLRUClock(),
+            poolSize: evictionPool.length,
         },
     };
 }
@@ -287,10 +382,14 @@ module.exports = {
     configureEviction,
     evictIfNeeded,
     evictAllRandomKeys,
+    evictApproxLRU,
     cacheStats,
     clearStore,
     setEnvironment,
     getInfo,
+    getLRUClock,
+    getIdleTime,
+    evictionPool,
     OBJ_TYPE_STRING,
     OBJ_ENCODING_RAW,
     OBJ_ENCODING_INT,
@@ -307,4 +406,9 @@ module.exports = {
     EXPIRE_SAMPLE_SIZE,
     DEFAULT_MAX_KEYS: ENV_CONFIG[ENV_DEV].maxKeys,
     DEFAULT_MAX_BYTES: 10 * 1024 * 1024,
+    LRU_BITS,
+    LRU_CLOCK_MAX,
+    LRU_CLOCK_RESOLUTION,
+    EVICTION_POOL_SIZE,
+    LRU_SAMPLE_SIZE,
 };

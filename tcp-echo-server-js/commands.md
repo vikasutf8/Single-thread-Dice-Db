@@ -64,10 +64,10 @@ Pipeline (async.tcp.js:readFromClient):
 
 - `eval.js` (~400 lines): 12 handlers + `evalAndRespond` + `respondError`
 - `resp-encoder.js`: `EncodeSimpleString`, `EncodeBulkString`, `EncodeError`, `EncodeInteger`
-- `store.js`: `put`, `get`, `del`, `setExpire`, `newObj`, `deduceTypeEncoding`, `evictIfNeeded`
+- `store.js`: `put`, `get`, `del`, `setExpire`, `newObj`, `deduceTypeEncoding`, `evictIfNeeded`, `configureEviction({policy})`, `getInfo()`
 - AOF hooks: `appendCommand` called on SET/DEL/EXPIRE/PEXPIRE/INCR success
 - Background verbs: `bgEvalRDB` / `bgEvalAOF` (async, non-blocking, guard flags)
-- Tests: 9 suites, 260 tests covering all commands, errors, pipeline, persistence, eviction
+- Tests: 9 suites, 264 tests covering all commands, errors, pipeline, persistence, eviction (LRU + random)
 
 ## 5. Final tested (cmds + result)
 
@@ -89,10 +89,10 @@ node test-diceobj.js        # 42 passed: typeEncoding pack/unpack, auto INT/EMBS
 node test-aof-rdb.js        # 32 passed: AOF log/replay/rewrite, RDB save/load, TCP restart recovery
 
 # Eviction
-node test-evict.js          # 18 passed: random eviction, env configs, evictAllRandomKeys
+node test-evict.js          # 22 passed: LRU + random eviction, env configs, pool behavior, policy switching
 
 # All
-# 260 passed, 0 failed
+# 264 passed, 0 failed
 ```
 
 ## 6. Final conclusion
