@@ -17,7 +17,7 @@
 // evalAndRespond only dispatches — it must NOT write again (double-write
 // would corrupt pipelined streams, e.g. redis-benchmark).
 
-const { EncodeSimpleString, EncodeBulkString, EncodeError, EncodeInteger } = require("./resp-encoder");
+const { EncodeSimpleString, EncodeBulkString, EncodeError, EncodeInteger, EncodeArray } = require("./resp-encoder");
 const { newObj, put, get, del, setExpire, OBJ_TYPE_STRING, assertType, deduceTypeEncoding, packTypeEncoding, getType, getInfo } = require("./store");
 const { appendCommand, bgEvalAOF, isRewriting } = require("./aof");
 const { bgEvalRDB, dumpRDBSync, isSaving } = require("./rdb");
@@ -322,55 +322,180 @@ function evalINFO(args, conn) {
     return out;
 }
 
-// Entry: dispatch on upper-cased Cmd. Never throws.
-// Each eval*() already did the single conn.write — no write here.
-function evalAndRespond(redisCmd, conn) {
+// ---------------------------------------------------------------------------
+// Transactions: per-client state lives on the client object created in
+// async.tcp.js: { cqueue, isTxn, txnDirty, executing, write() }.
+// evalAndRespond queues data commands while isTxn; EXEC runs them back-to-back.
+// ---------------------------------------------------------------------------
+
+// Sink used by executeCommand so handlers never write directly: the caller
+// (evalAndRespond / EXEC) owns the single write of the returned bytes.
+const NULL_CONN = { write() { } };
+
+// Commands that control the transaction rather than being queued by it.
+const TX_CONTROL = new Set(["MULTI", "EXEC", "DISCARD"]);
+
+// Queue-time arity validation — Redis rejects these at queue time and marks
+// the transaction dirty, so EXEC returns EXECABORT. max = -1 means unbounded.
+const TX_QUEUE_ARITY = {
+    PING: [0, 1],
+    SET: [2, -1],
+    GET: [1, 1],
+    TTL: [1, 1],
+    DEL: [1, -1],
+    EXPIRE: [2, 2],
+    PEXPIRE: [2, 2],
+    INCR: [1, 1],
+    BGSAVE: [0, 0],
+    BGREWRITEAOF: [0, 0],
+    SAVE: [0, 0],
+    INFO: [0, 0],
+};
+
+function respOk() {
+    return EncodeSimpleString("OK");
+}
+
+function resetTxn(client) {
+    if (!client || typeof client !== "object") return;
+    client.isTxn = false;
+    client.cqueue = [];
+    client.txnDirty = false;
+    client.executing = false;
+}
+
+// Queue a command inside MULTI. Returns the reply bytes (+QUEUED or -ERR).
+// Unknown commands and bad arity set txnDirty so EXEC aborts the transaction.
+function queueTxnCommand(redisCmd, client) {
+    const verb = redisCmd.Cmd.toUpperCase();
+    const args = redisCmd.Args || [];
+    const arity = TX_QUEUE_ARITY[verb];
+    if (!arity) {
+        client.txnDirty = true;
+        return EncodeError(`unknown command '${String(redisCmd.Cmd).toLowerCase()}'`);
+    }
+    const [min, max] = arity;
+    if (args.length < min || (max >= 0 && args.length > max)) {
+        client.txnDirty = true;
+        return EncodeError(`wrong number of arguments for '${verb.toLowerCase()}' command`);
+    }
+    client.cqueue.push({ Cmd: verb, Args: args.slice() });
+    return EncodeSimpleString("QUEUED");
+}
+
+// MULTI → +OK; nested MULTI → error (transaction keeps going, not dirty).
+function evalMULTI(client) {
+    if (!client || typeof client !== "object") {
+        return EncodeError("MULTI calls can not be nested");
+    }
+    if (client.isTxn) {
+        return EncodeError("MULTI calls can not be nested");
+    }
+    client.isTxn = true;
+    client.cqueue = [];
+    client.txnDirty = false;
+    client.executing = false;
+    return respOk();
+}
+
+// EXEC → *N array of per-command replies, in queue order.
+// Queue-time errors → EXECABORT (nothing runs, state is reset).
+function evalEXEC(client) {
+    if (!client || !client.isTxn) {
+        return EncodeError("EXEC without MULTI");
+    }
+    if (client.txnDirty) {
+        resetTxn(client);
+        return EncodeError("EXECABORT Transaction discarded because of previous errors.");
+    }
+    const queue = client.cqueue.slice();
+    client.executing = true; // commands run directly, never re-queued
+    const replies = [];
+    for (const queued of queue) {
+        replies.push(executeCommand(queued, client));
+    }
+    resetTxn(client);
+    return EncodeArray(replies);
+}
+
+// User-facing alias: evalMulti is the EXEC array responder.
+function evalMulti(client) {
+    return evalEXEC(client);
+}
+
+// DISCARD → drop the queue, keyspace untouched, +OK.
+function evalDISCARD(client) {
+    if (!client || !client.isTxn) {
+        return EncodeError("DISCARD without MULTI");
+    }
+    resetTxn(client);
+    return respOk();
+}
+
+// executeCommand(cmd, client) → reply bytes (Buffer). Pure dispatch: never
+// writes to the socket. Handlers get NULL_CONN to suppress their own write.
+function executeCommand(redisCmd, client) {
     if (!redisCmd || typeof redisCmd.Cmd !== "string") {
-        respondError(new Error("empty command"), conn);
-        return;
+        return EncodeError("empty command");
     }
     const args = redisCmd.Args || [];
     switch (redisCmd.Cmd.toUpperCase()) {
         case "PING":
-            evalPING(args, conn);
-            break;
+            return evalPING(args, NULL_CONN);
         case "SET":
-            evalSET(args, conn);
-            break;
+            return evalSET(args, NULL_CONN);
         case "GET":
-            evalGET(args, conn);
-            break;
+            return evalGET(args, NULL_CONN);
         case "TTL":
-            evalTTL(args, conn);
-            break;
+            return evalTTL(args, NULL_CONN);
         case "DEL":
-            evalDEL(args, conn);
-            break;
+            return evalDEL(args, NULL_CONN);
         case "EXPIRE":
-            evalEXPIRE(args, conn);
-            break;
+            return evalEXPIRE(args, NULL_CONN);
         case "PEXPIRE":
-            evalPEXPIRE(args, conn);
-            break;
+            return evalPEXPIRE(args, NULL_CONN);
         case "INCR":
-            evalINCR(args, conn);
-            break;
+            return evalINCR(args, NULL_CONN);
         case "BGSAVE":
-            evalBGSAVE(args, conn);
-            break;
+            return evalBGSAVE(args, NULL_CONN);
         case "BGREWRITEAOF":
-            evalBGREWRITEAOF(args, conn);
-            break;
+            return evalBGREWRITEAOF(args, NULL_CONN);
         case "SAVE":
-            evalSAVE(args, conn);
-            break;
+            return evalSAVE(args, NULL_CONN);
         case "INFO":
-            evalINFO(args, conn);
-            break;
+            return evalINFO(args, NULL_CONN);
+        case "MULTI":
+            return evalMULTI(client);
+        case "EXEC":
+            return evalEXEC(client);
+        case "DISCARD":
+            return evalDISCARD(client);
         default:
-            evalDefault(redisCmd, conn);
-            break;
+            return evalDefault(redisCmd, NULL_CONN);
     }
+}
+
+// Explicit bytes-contract alias (execute command → response buffer).
+function executeCmdToBuffer(redisCmd, client) {
+    return executeCommand(redisCmd, client);
+}
+
+// Entry: dispatch on upper-cased Cmd. Never throws.
+// If the client is inside MULTI (and not already executing EXEC), data commands
+// are validated, queued, and answered +QUEUED; the single write happens here.
+function evalAndRespond(redisCmd, client) {
+    if (!redisCmd || typeof redisCmd.Cmd !== "string") {
+        respondError(new Error("empty command"), client);
+        return;
+    }
+    const verb = redisCmd.Cmd.toUpperCase();
+    if (client && client.isTxn && !client.executing && !TX_CONTROL.has(verb)) {
+        const queuedReply = queueTxnCommand(redisCmd, client);
+        if (typeof client.write === "function") client.write(queuedReply);
+        return;
+    }
+    const out = executeCommand(redisCmd, client);
+    if (client && typeof client.write === "function") client.write(out);
 }
 
 // Old echo-server shape kept for compatibility: respond(conn, bytes).
@@ -393,6 +518,15 @@ module.exports = {
     evalSAVE,
     evalINFO,
     evalDefault,
+    evalMULTI,
+    evalEXEC,
+    evalMulti,
+    evalDISCARD,
+    executeCommand,
+    executeCmdToBuffer,
+    queueTxnCommand,
+    resetTxn,
+    respOk,
     evalAndRespond,
     respondError,
     respond,

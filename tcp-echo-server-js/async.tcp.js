@@ -64,6 +64,11 @@ let nextFd = 100; // fake fd numbers for logging (real fd hidden inside libuv)
 // fd registry == epoll interest list: fd -> FdComm { fd, socket, leftover, addr }
 const fdRegistry = new Map();
 
+// Per-client state registry: fd -> client { fd, socket, cqueue, isTxn, ... }.
+// Transactions are per connection: MULTI/EXEC/DISCARD only touch this client's
+// queue, so concurrent clients never share transaction state.
+const connectedClients = new Map();
+
 // ---------------------------------------------------------------------------
 // EpollCtl(epollFd, op, fd, event) — emulated over the Map.
 // In C/Go this registers kernel interest; here it tracks which sockets we
@@ -94,6 +99,32 @@ function parseIP(host) {
         throw new Error(`parseIP: invalid host ${JSON.stringify(host)}`);
     }
     return host;
+}
+
+// ---------------------------------------------------------------------------
+// initClient(fdComm) — create the per-connection state object and register it
+// in connectedClients. Called on every accept (EpollCtl ADD step).
+//   cqueue    : RedisCmd[] queued between MULTI and EXEC
+//   isTxn     : true while MULTI is open
+//   txnDirty  : queue-time error seen -> EXEC returns EXECABORT
+//   executing : true while EXEC is running (never re-queue)
+//   write()   : io.ReadWriter used by evalAndRespond
+// ---------------------------------------------------------------------------
+function initClient(fdComm) {
+    const client = {
+        fd: fdComm.fd,
+        socket: fdComm.socket,
+        addr: fdComm.addr,
+        cqueue: [],
+        isTxn: false,
+        txnDirty: false,
+        executing: false,
+        write(bytes) {
+            return fdComm.socket.write(bytes);
+        },
+    };
+    connectedClients.set(client.fd, client);
+    return client;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,8 +181,8 @@ function readFromClient(fdComm) {
                 break;
             }
 
-            // Pipeline step: execute now, in order, no queueing.
-            evalAndRespond(cmd, conn);
+            // Pipeline step: execute now (or queue if this client is in MULTI).
+            evalAndRespond(cmd, fdComm.client);
             totalCommands++;
             batchDepth++;
             fdComm.leftover = fdComm.leftover.slice(n);
@@ -176,6 +207,7 @@ function readFromClient(fdComm) {
 function closeClient(fdComm, reason) {
     if (!fdRegistry.has(fdComm.fd)) return; // already removed (double close)
     EpollCtl(EPOLL_CTL_DEL, fdComm);
+    connectedClients.delete(fdComm.fd); // drop transaction state with the conn
     concurrentClients--;
     try { fdComm.socket.destroy(); } catch { /* already gone */ }
     console.log(
@@ -269,6 +301,7 @@ function RunAsyncTcpServer(host, port, opts = {}) {
             events: EPOLLIN,
             maxBuffer,
         };
+        fdComm.client = initClient(fdComm); // per-connection txn state
         EpollCtl(EPOLL_CTL_ADD, fdComm); // monitor this fd for EPOLLIN
         concurrentClients++;
         totalAccepted++;
@@ -409,6 +442,7 @@ function RunAsyncTcpServer(host, port, opts = {}) {
             accepted: totalAccepted,
             rejected: totalRejected,
             monitored: fdRegistry.size,
+            clients: connectedClients.size,
             commands: totalCommands,
             batches: totalBatches,
             maxBatchDepth,
@@ -459,6 +493,8 @@ function setupGracefulShutdown(serverHandle, opts = {}) {
 module.exports = {
     RunAsyncTcpServer,
     setupGracefulShutdown,
+    initClient,
+    connectedClients,
     EPOLLIN,
     EPOLL_CTL_ADD,
     EPOLL_CTL_DEL,

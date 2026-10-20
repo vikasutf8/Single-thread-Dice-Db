@@ -315,4 +315,151 @@ Round C (shutdown WHILE 100 clients mid-flight): AOF + RDB on, shutdown after 30
   finishes in 113ms under live load with AOF fsync + RDB snapshot, zero data
   loss for accepted commands, `active`/`monitored` back to 0.
 
+## Run — 2026-10-20 06:59:02 UTC
+
+- Change under test: **transactions** — `MULTI` / `EXEC` / `DISCARD` in
+  `eval.js` (queue phase → `+QUEUED`, EXEC → `*N` array, queue-time errors →
+  `EXECABORT`, DISCARD drops queue) + per-client state in `async.tcp.js`
+  (`connectedClients` Map, `initClient()` → `{cqueue, isTxn, txnDirty,
+  executing, write}`) + `EncodeArray` in `resp-encoder.js`
+  (see `transactions.md`). **Prod env**: maxKeys=200000, evictPercent=4%,
+  allkeys-lru.
+- Basic + regression suites:
+
+```text
+test-multi.js:             79 passed, 0 failed  (MULTI/EXEC/DISCARD direct +
+                                            wire; +QUEUED before EXEC; queue
+                                            not applied early; *N reply order;
+                                            empty txn *0; nested MULTI keeps
+                                            txn; unknown/bad-arity → EXECABORT
+                                            applies nothing; runtime error stays
+                                            an array element; DISCARD untouched
+                                            keyspace; 2-socket isolation;
+                                            connectedClients registry drain)
+test-load-multi.js:        37 passed, 0 failed  (prod rounds A/B/C/D/E below)
+test-graceful-shutdown.js: 17 passed, 0 failed
+test-load-graceful.js:     21 passed, 0 failed
+test-evict.js:             22 passed, 0 failed
+test-aof-rdb.js:           32 passed, 0 failed
+test-diceobj.js:           42 passed, 0 failed
+test-del-expire.js:        37 passed, 0 failed
+test-get-set-ttl.js:       34 passed, 0 failed
+test-incr.js:              21 passed, 0 failed
+test-ping.js:              20 passed, 0 failed
+test-pipeline.js:          21 passed, 0 failed
+test-resp-decoder.js:      35 passed, 0 failed
+```
+
+- Transaction load test at prod env (scripted RESP-over-TCP, one write per
+  transaction batch; every reply byte-compared, incl. all `+QUEUED` and the
+  EXEC `*N` array):
+
+```text
+Round A (MULTI + 10 SETs + EXEC): 100 conns x 20 batches = 24k cmds
+  -> ok=100/100 byte-exact, 0 timeouts, 134ms = 179k cmds/s
+  -> keys=20000 written by EXEC; evicted=0 (below prod limit); pool=16
+Round B (deep queue: MULTI + 200 SETs + EXEC): 50 conns x 5 batches = 50.5k cmds
+  -> ok=50/50 byte-exact, 0 timeouts, 179ms = 282k cmds/s
+  -> keys=50000; evicted=0
+Round C (MULTI + 20 SETs + DISCARD): 100 conns x 10 batches = 22k cmds
+  -> ok=100/100 byte-exact, 0 timeouts, 47ms = 468k cmds/s
+  -> keys=0 (all discarded, keyspace untouched)
+Round D (MULTI + bad arity + EXECABORT): 50 conns x 5 batches = 3k cmds
+  -> ok=50/50 byte-exact (-ERR then -EXECABORT), 10ms = 300k cmds/s
+  -> keys=0 (aborted transaction wrote nothing)
+Round E (mixed SET + MULTI + 5 SETs + EXEC + PING): 100 conns x 10 batches
+  -> ok=100/100 byte-exact, 0 timeouts, 32ms = 281k cmds/s
+  -> keys=6000 (1 direct + 5 txn per batch)
+Total: 108.5k cmds in 402ms = 270k cmds/s, zero mismatches, zero timeouts
+Drain: clients=0, monitored=0 (no fd/txn-state leak), commands counter=108500
+```
+
+```text
+=== LOAD SUMMARY (prod env, transactions) ===
+{
+  "config": {
+    "maxKeys": 200000,
+    "evictPercent": 0.04,
+    "policy": "allkeys-lru"
+  },
+  "rounds": {
+    "A": {
+      "shape": "MULTI+10SET+EXEC",
+      "ok": 100,
+      "mismatch": 0,
+      "timeouts": 0,
+      "partial": 0,
+      "cmds": 24000,
+      "ms": 130,
+      "kcmds": 185
+    },
+    "B": {
+      "shape": "MULTI+200SET+EXEC",
+      "ok": 50,
+      "mismatch": 0,
+      "timeouts": 0,
+      "partial": 0,
+      "cmds": 50500,
+      "ms": 174,
+      "kcmds": 290
+    },
+    "C": {
+      "shape": "MULTI+20SET+DISCARD",
+      "ok": 100,
+      "mismatch": 0,
+      "timeouts": 0,
+      "partial": 0,
+      "cmds": 22000,
+      "ms": 45,
+      "kcmds": 489
+    },
+    "D": {
+      "shape": "MULTI+badArity+EXECABORT",
+      "ok": 50,
+      "mismatch": 0,
+      "timeouts": 0,
+      "partial": 0,
+      "cmds": 3000,
+      "ms": 10,
+      "kcmds": 300
+    },
+    "E": {
+      "shape": "SET+MULTI+5SET+EXEC+PING",
+      "ok": 100,
+      "mismatch": 0,
+      "timeouts": 0,
+      "partial": 0,
+      "cmds": 9000,
+      "ms": 31,
+      "kcmds": 290
+    }
+  },
+  "total": {
+    "cmds": 108500,
+    "ms": 390,
+    "kcmds": 278
+  },
+  "keyspace": {
+    "keys": 6000,
+    "evicted": 0,
+    "poolSize": 16,
+    "maxKeys": 200000,
+    "evictPercent": 0.04,
+    "policy": "allkeys-lru"
+  },
+  "stats": {
+    "clients": 0,
+    "monitored": 0,
+    "commands": 108500
+  }
+}
+
+```
+
+- Result: PASS — 418/418 across 13 suites (302 prior + 79 transaction + 37
+  transaction load); queue/EXEC/DISCARD wire-exact under prod config,
+  byte-exact `*N` arrays under 100 concurrent clients, DISCARD and EXECABORT
+  confirmed non-writing, per-client isolation holds over real sockets,
+  `active`/`monitored` back to 0 (transaction state freed with the connection).
+
 

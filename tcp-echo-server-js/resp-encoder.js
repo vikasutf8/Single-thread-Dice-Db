@@ -29,9 +29,20 @@ function EncodeInteger(n) {
     return Buffer.from(`:${Number(n)}\r\n`, "utf8");
 }
 
+// EncodeArray(items) — RESP2 array: *N\r\n followed by each pre-encoded item.
+// Used by EXEC to return the queued commands' replies as one array.
+function EncodeArray(items) {
+    const parts = [Buffer.from(`*${items.length}\r\n`, "utf8")];
+    for (const item of items) {
+        parts.push(Buffer.isBuffer(item) ? item : Buffer.from(String(item), "utf8"));
+    }
+    return Buffer.concat(parts);
+}
+
 module.exports = {
     EncodeSimpleString,
     EncodeBulkString,
     EncodeError,
     EncodeInteger,
+    EncodeArray,
 };
