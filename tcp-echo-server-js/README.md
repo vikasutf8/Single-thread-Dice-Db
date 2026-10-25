@@ -244,7 +244,7 @@ Every feature follows the same spec-first format: **What / Plan / Arch / Execute
 | `graceful-shutdown.md` | Drain sequence, fsync, signals, load-under-shutdown |
 | `load_test.md` | Append-only benchmark history (9 runs) |
 | `tcp-echo-server-notes.md` | Original Go/Node echo-server foundation |
-| `resume.md` | Earlier project snapshot (pre-transactions) |
+| `resume.md` | X-Y-Z resume bullets, verified metrics, and project summary |
 
 ---
 
